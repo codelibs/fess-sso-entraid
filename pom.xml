@@ -1,0 +1,205 @@
+<?xml version="1.0"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/maven-v4_0_0.xsd">
+	<modelVersion>4.0.0</modelVersion>
+	<artifactId>fess-sso-entraid</artifactId>
+	<packaging>jar</packaging>
+	<name>Microsoft Entra ID SSO Plugin</name>
+	<version>15.9.0-SNAPSHOT</version>
+	<description>Microsoft Entra ID single sign-on for Fess: the authenticator behind sso.type=entraid.</description>
+	<scm>
+		<connection>scm:git:git@github.com:codelibs/fess-sso-entraid.git</connection>
+		<developerConnection>scm:git:git@github.com:codelibs/fess-sso-entraid.git</developerConnection>
+		<url>https://github.com/codelibs/fess-sso-entraid</url>
+		<tag>HEAD</tag>
+	</scm>
+	<parent>
+		<groupId>org.codelibs.fess</groupId>
+		<artifactId>fess-parent</artifactId>
+		<version>15.9.0-SNAPSHOT</version>
+		<relativePath />
+	</parent>
+	<build>
+		<plugins>
+			<plugin>
+				<artifactId>maven-compiler-plugin</artifactId>
+			</plugin>
+			<plugin>
+				<artifactId>maven-source-plugin</artifactId>
+			</plugin>
+			<plugin>
+				<artifactId>maven-jar-plugin</artifactId>
+				<configuration>
+					<archive>
+						<manifest>
+							<addDefaultImplementationEntries>true</addDefaultImplementationEntries>
+						</manifest>
+						<manifestEntries>
+							<!-- Mounts this jar into the webapp class loader (FessWebResourceRoot). The
+							     authenticator runs in the login flow: SsoAction and FessLoginAssist are
+							     webapp classes, so the webapp has to see it. No child process needs it,
+							     but they get WEB-INF/plugin on their class path regardless of this entry. -->
+							<Fess-WebAppJar>true</Fess-WebAppJar>
+						</manifestEntries>
+					</archive>
+				</configuration>
+			</plugin>
+			<plugin>
+				<artifactId>maven-shade-plugin</artifactId>
+				<executions>
+					<execution>
+						<phase>package</phase>
+						<goals>
+							<goal>shade</goal>
+						</goals>
+						<configuration>
+							<createDependencyReducedPom>false</createDependencyReducedPom>
+							<!-- No relocation. MSAL4J reads its own class names out of configuration and
+							     resource files, and the Nimbus SDK is named by both this jar and MSAL4J,
+							     so a relocated copy would leave one of them with nothing to bind to. -->
+							<artifactSet>
+								<!-- What the war already carries. Declaring org.codelibs.fess:fess as provided
+								     does not keep these two out on its own: when Fess and MSAL4J or the Nimbus
+								     SDK need the same artifact, Maven keeps Fess's version but widens the scope
+								     to the widest of the two, so the node arrives at compile or runtime instead
+								     of provided and would be shaded.
+								     Both are direct compile dependencies of Fess, and asm resolves to Fess's
+								     9.10.1 rather than the 9.7.1 accessors-smart asks for. WEB-INF/lib precedes
+								     WEB-INF/plugin on every class path Fess builds, so a shaded copy of either
+								     would never be read: leaving them out keeps one version of each class in the
+								     installation and the combined class path equal to what the war had before
+								     the split.
+								     Under-excluding wastes space; over-excluding fails at run time with
+								     NoClassDefFoundError, so verify against `mvn dependency:list` before adding
+								     an entry. curl4j, guava and log4j stay in the war as direct dependencies of
+								     Fess and never reach this list. -->
+								<excludes>
+									<exclude>org.ow2.asm:*</exclude>
+									<exclude>org.slf4j:*</exclude>
+								</excludes>
+							</artifactSet>
+							<filters>
+								<filter>
+									<artifact>*:*</artifact>
+									<excludes>
+										<exclude>META-INF/*.SF</exclude>
+										<exclude>META-INF/*.DSA</exclude>
+										<exclude>META-INF/*.RSA</exclude>
+										<exclude>module-info.class</exclude>
+									</excludes>
+								</filter>
+							</filters>
+							<transformers>
+								<transformer implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer" />
+							</transformers>
+						</configuration>
+					</execution>
+				</executions>
+			</plugin>
+			<plugin>
+				<artifactId>maven-javadoc-plugin</artifactId>
+			</plugin>
+			<plugin>
+				<groupId>com.mycila</groupId>
+				<artifactId>license-maven-plugin</artifactId>
+			</plugin>
+			<plugin>
+				<groupId>net.revelc.code.formatter</groupId>
+				<artifactId>formatter-maven-plugin</artifactId>
+			</plugin>
+		</plugins>
+	</build>
+	<!-- Fess plugins are distributed through maven.codelibs.org instead of Maven Central.
+	     This cannot be inherited from fess-parent: distributionManagement is inherited
+	     unconditionally, so declaring it there would also redirect the SNAPSHOT
+	     deployments of fess-parent, fess, fess-crawler, fess-crawler-playwright and
+	     fess-suggest, which stay on Maven Central. The scpexe transport comes from
+	     the wagon-ssh-external build extension inherited from fess-parent. -->
+	<distributionManagement>
+		<repository>
+			<id>codelibs-repo</id>
+			<name>CodeLibs Repository</name>
+			<url>scpexe://maven.codelibs.org/var/www/maven/release</url>
+		</repository>
+		<snapshotRepository>
+			<id>codelibs-snapshots</id>
+			<name>CodeLibs Snapshot Repository</name>
+			<url>scpexe://maven.codelibs.org/var/www/maven/snapshot</url>
+		</snapshotRepository>
+	</distributionManagement>
+	<repositories>
+		<repository>
+			<id>snapshots.central.sonatype.com</id>
+			<url>https://central.sonatype.com/repository/maven-snapshots</url>
+			<releases>
+				<enabled>false</enabled>
+			</releases>
+			<snapshots>
+				<enabled>true</enabled>
+			</snapshots>
+		</repository>
+	</repositories>
+	<dependencies>
+		<!-- Declared before msal4j on purpose: Fess's own dependencies then arrive as
+		     provided transitive nodes, and most of what the war carries is therefore left out of
+		     the shade. Ordering does not settle every case: where the two paths disagree Maven
+		     keeps one node and widens its scope, and those arrive at compile or runtime instead.
+		     That is what the exclude list above is for. -->
+		<dependency>
+			<groupId>org.codelibs.fess</groupId>
+			<artifactId>fess</artifactId>
+			<version>${fess.version}</version>
+			<scope>provided</scope>
+		</dependency>
+		<dependency>
+			<groupId>jakarta.annotation</groupId>
+			<artifactId>jakarta.annotation-api</artifactId>
+			<version>${jakarta.annotation.api.version}</version>
+			<scope>provided</scope>
+		</dependency>
+		<dependency>
+			<!-- HttpServletRequest and HttpSession, for the state cookie and the session the
+			     authorisation code lands in. Tomcat supplies these at run time. -->
+			<groupId>jakarta.servlet</groupId>
+			<artifactId>jakarta.servlet-api</artifactId>
+			<version>${jakarta.servlet.api.version}</version>
+			<scope>provided</scope>
+		</dependency>
+		<dependency>
+			<!-- The Microsoft Authentication Library: ConfidentialClientApplication, its token
+			     cache and the silent acquisition behind EntraIdUser.refresh(). Kept at the version
+			     fess-parent pins; the Microsoft Graph calls in this plugin rely on curl4j not
+			     throwing on a non-2xx response, so the versions of neither move independently. -->
+			<groupId>com.microsoft.azure</groupId>
+			<artifactId>msal4j</artifactId>
+			<version>${msal4j.version}</version>
+		</dependency>
+		<dependency>
+			<!-- AuthenticationResponseParser and the JWT parser. Declared directly because MSAL4J
+			     itself only asks for the Nimbus SDK in test scope, so nothing else supplies it. -->
+			<groupId>com.nimbusds</groupId>
+			<artifactId>oauth2-oidc-sdk</artifactId>
+			<version>${oauth2.oidc.sdk.version}</version>
+		</dependency>
+		<dependency>
+			<groupId>org.junit.jupiter</groupId>
+			<artifactId>junit-jupiter-api</artifactId>
+			<version>${junit.jupiter.version}</version>
+			<scope>test</scope>
+		</dependency>
+		<dependency>
+			<groupId>org.junit.jupiter</groupId>
+			<artifactId>junit-jupiter-engine</artifactId>
+			<version>${junit.jupiter.version}</version>
+			<scope>test</scope>
+		</dependency>
+		<dependency>
+			<!-- WebContainerTestCase and MockletHttpServletRequest, for the container the tests
+			     moved from Fess run in. Fess has the same test dependency, but a test-scope
+			     dependency does not transit. -->
+			<groupId>org.dbflute.utflute</groupId>
+			<artifactId>utflute-lastaflute</artifactId>
+			<version>${utflute.version}</version>
+			<scope>test</scope>
+		</dependency>
+	</dependencies>
+</project>
