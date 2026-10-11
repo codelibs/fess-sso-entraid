@@ -72,8 +72,10 @@ import com.microsoft.aad.msal4j.ConfidentialClientApplication;
 import com.microsoft.aad.msal4j.IAccount;
 import com.microsoft.aad.msal4j.IAuthenticationResult;
 import com.microsoft.aad.msal4j.ITenantProfile;
+import com.nimbusds.oauth2.sdk.AuthorizationCode;
 import com.nimbusds.oauth2.sdk.id.State;
 import com.nimbusds.oauth2.sdk.token.BearerAccessToken;
+import com.nimbusds.openid.connect.sdk.AuthenticationResponseParser;
 import com.nimbusds.openid.connect.sdk.AuthenticationSuccessResponse;
 import com.sun.net.httpserver.HttpServer;
 
@@ -3063,5 +3065,360 @@ public class EntraIdAuthenticatorTest extends UnitFessTestCase {
         authenticator.updateMemberOf(user);
 
         assertEquals(1, walked.size());
+    }
+
+    private static final String MARKER = "UNIQUEMARKER123";
+
+    /** A line break of any kind, which would start a line of the application log. */
+    private static final String LINE_BREAK = "(?s).*[\\r\\n\\u0085\\u2028\\u2029].*";
+
+    private static final String PARSE_FAILURE = "Failed to parse an authentication response: ";
+
+    private MockletHttpServletRequest callbackOfOwnSession(final EntraIdAuthenticator authenticator) {
+        // The state is one this server issued, so the callback is parsed and not dismissed as
+        // belonging to no login.
+        ComponentUtil.register(new SystemHelper(), "systemHelper");
+        final MockletHttpServletRequest request = getMockRequest();
+        request.setMethod("GET");
+        final String state = URLDecoder.decode(authenticator.getAuthUrl(request).replaceFirst("(?s).*[&?]state=([^&]*).*", "$1"),
+                StandardCharsets.UTF_8);
+        request.setParameter("state", state);
+        return request;
+    }
+
+    @Test
+    public void test_processAuthenticationData_reportsACallbackThatCannotBeParsedAsARejectedRequest() {
+        // The id_token is not a JWT. Anyone who can start a login can send that, so it is not logged
+        // with a stack trace, and the reason is in the message because SsoAction does not log the cause.
+        final EntraIdAuthenticator authenticator = new EntraIdAuthenticator();
+        final MockletHttpServletRequest request = callbackOfOwnSession(authenticator);
+        request.setParameter("id_token", MARKER);
+        request.setParameter("code", MARKER + "-code");
+
+        try {
+            authenticator.processAuthenticationData(request);
+            fail("expected SsoStateException");
+        } catch (final SsoStateException e) {
+            assertTrue(e.getMessage(), e.getMessage().startsWith(PARSE_FAILURE));
+            assertTrue(e.getMessage(), e.getMessage().length() > PARSE_FAILURE.length());
+            assertFalse(e.getMessage(), e.getMessage().matches(LINE_BREAK));
+            // Neither the id_token nor the authorization code nor the state is in the text
+            assertFalse(e.getMessage(), e.getMessage().contains(MARKER));
+            assertFalse(e.getMessage(), e.getMessage().contains(request.getParameter("state")));
+        }
+    }
+
+    @Test
+    public void test_parseAuthenticationResponse_neverEchoesTheCodeOrTheTokens() {
+        final EntraIdAuthenticator authenticator = new EntraIdAuthenticator();
+        final String url = "http://localhost:8080/sso/";
+        final List<Map<String, List<String>>> callbacks = new ArrayList<>();
+        // The parser refuses these. None of the values may reach the message.
+        callbacks.add(Map.of("id_token", List.of(MARKER), "code", List.of(MARKER)));
+        callbacks.add(Map.of("id_token", List.of(MARKER + "." + MARKER + "." + MARKER), "code", List.of(MARKER)));
+        callbacks.add(Map.of("access_token", List.of(MARKER), "state", List.of(MARKER)));
+        callbacks.add(Map.of("access_token", List.of(MARKER), "token_type", List.of("Bearer"), "expires_in", List.of(MARKER)));
+        callbacks.add(Map.of("code", List.of(MARKER), "id_token", List.of(MARKER + "\r\n" + "A".repeat(5000))));
+        for (final Map<String, List<String>> params : callbacks) {
+            try {
+                authenticator.parseAuthenticationResponse(url, params);
+                fail("expected SsoStateException for " + params);
+            } catch (final SsoStateException e) {
+                assertTrue(e.getMessage(), e.getMessage().startsWith(PARSE_FAILURE));
+                assertFalse(e.getMessage(), e.getMessage().contains(MARKER));
+                assertFalse(e.getMessage(), e.getMessage().matches(LINE_BREAK));
+            }
+        }
+    }
+
+    @Test
+    public void test_parseAuthenticationResponse_keepsAnEchoedValueToOneBoundedLine() {
+        // The one message that quotes the caller's text: "Unsupported token_type: <value>".
+        final EntraIdAuthenticator authenticator = new EntraIdAuthenticator();
+        final String hostile = MARKER + "\r\nINJECTED\u2028A\u0085B\u2029C\u0000\u001b[31m" + "T".repeat(5000);
+        try {
+            authenticator.parseAuthenticationResponse("http://localhost:8080/sso/",
+                    Map.of("access_token", List.of("a"), "token_type", List.of(hostile)));
+            fail("expected SsoStateException");
+        } catch (final SsoStateException e) {
+            assertTrue(e.getMessage(), e.getMessage().startsWith(PARSE_FAILURE + "Unsupported token_type: "));
+            assertFalse(e.getMessage(), e.getMessage().matches(LINE_BREAK));
+            assertFalse(e.getMessage(), e.getMessage().matches("(?s).*\\p{Cntrl}.*"));
+            assertTrue(e.getMessage(), e.getMessage().length() <= PARSE_FAILURE.length() + EntraIdAuthenticator.MAX_LOGGED_LENGTH + 3);
+        }
+    }
+
+    @Test
+    public void test_parseAuthenticationResponse_neverEchoesTheUrlOfAMalformedCallback() {
+        // The message of the URISyntaxException quotes the whole URL, authorization code included
+        final EntraIdAuthenticator authenticator = new EntraIdAuthenticator();
+        for (final String query : List.of("code=" + MARKER + "&x=a b", "code=" + MARKER + "%zz", "code=" + MARKER + "\u2028|")) {
+            try {
+                authenticator.parseAuthenticationResponse("http://localhost:8080/sso/?" + query, Map.of("code", List.of(MARKER)));
+                fail("expected SsoStateException for " + query);
+            } catch (final SsoStateException e) {
+                assertTrue(e.getMessage(), e.getMessage().startsWith(PARSE_FAILURE));
+                assertTrue(e.getMessage(), e.getMessage().length() > PARSE_FAILURE.length());
+                assertFalse(e.getMessage(), e.getMessage().contains(MARKER));
+                assertFalse(e.getMessage(), e.getMessage().contains("localhost"));
+                assertFalse(e.getMessage(), e.getMessage().matches(LINE_BREAK));
+            }
+        }
+    }
+
+    @Test
+    public void test_parseAuthenticationResponse_keepsTheStackTraceOfAnythingElse() {
+        // Only what the parser reports about its input is a rejected request. A failure of another kind
+        // (here a map of parameters that breaks while it is read, which no caller can cause) may be a
+        // defect, and keeps its stack trace.
+        final EntraIdAuthenticator authenticator = new EntraIdAuthenticator();
+        final Map<String, List<String>> broken = new HashMap<>() {
+            private static final long serialVersionUID = 1L;
+
+            @Override
+            public List<String> get(final Object key) {
+                throw new IllegalStateException("a defect");
+            }
+        };
+        final SsoLoginException e = org.junit.jupiter.api.Assertions.assertThrows(SsoLoginException.class,
+                () -> authenticator.parseAuthenticationResponse("http://localhost:8080/sso/", broken));
+        assertFalse(e.toString(), e instanceof SsoStateException);
+        assertEquals("Failed to parse an authentication response.", e.getMessage());
+        assertNotNull(e.getCause());
+    }
+
+    @Test
+    public void test_processAuthenticationData_reportsABlankCodeAsARejectedRequest() {
+        // The parser throws an IllegalArgumentException, not a ParseException, for a blank code
+        final EntraIdAuthenticator authenticator = new EntraIdAuthenticator();
+        for (final String blank : List.of("", " ", "\t", "\u2028")) {
+            final MockletHttpServletRequest request = callbackOfOwnSession(authenticator);
+            request.setParameter("code", blank);
+            try {
+                authenticator.processAuthenticationData(request);
+                fail("expected SsoStateException");
+            } catch (final SsoStateException e) {
+                assertEquals(PARSE_FAILURE + "the code parameter is blank", e.getMessage());
+            }
+        }
+    }
+
+    @Test
+    public void test_parseAuthenticationResponse_namesABlankParameterButNeverItsValue() {
+        final EntraIdAuthenticator authenticator = new EntraIdAuthenticator();
+        final SsoStateException scope = org.junit.jupiter.api.Assertions.assertThrows(SsoStateException.class,
+                () -> authenticator.parseAuthenticationResponse("http://localhost:8080/sso/", Map.of("access_token", List.of("a"),
+                        "token_type", List.of("Bearer"), "scope", List.of(MARKER + " \u2028 " + MARKER))));
+        assertEquals(PARSE_FAILURE + "the scope parameter has a blank entry", scope.getMessage());
+    }
+
+    @Test
+    public void test_parseAuthenticationResponse_leavesWhatTheParserAcceptsAndEveryOtherFailureAlone() {
+        // For every pair of values, the answer is the parser's own: what it accepts is returned, what it
+        // refuses with a ParseException is a rejected request, and an IllegalArgumentException (which it
+        // throws for a blank code, and for a blank entry of the scope of an access token) is a rejected
+        // request as well. A callback with an error is read as one whatever the code is.
+        final EntraIdAuthenticator authenticator = new EntraIdAuthenticator();
+        final List<String> names = List.of("code", "error", "access_token", "token_type", "scope", "id_token");
+        final List<String> values = List.of("", " ", "\t", "\u2028", "\u00a0", "a \t b", "a  b", "a \u2003", "a \n", "Bearer", "x");
+        int illegal = 0;
+        for (final String n1 : names) {
+            for (final String v1 : values) {
+                for (final String n2 : names) {
+                    for (final String v2 : values) {
+                        final Map<String, List<String>> params = new LinkedHashMap<>();
+                        params.put("access_token", List.of("a"));
+                        params.put("token_type", List.of("Bearer"));
+                        params.put(n1, List.of(v1));
+                        params.put(n2, List.of(v2));
+                        final String url = "http://localhost:8080/sso/";
+                        Throwable expected = null;
+                        try {
+                            AuthenticationResponseParser.parse(URI.create(url), params);
+                        } catch (final Exception e) {
+                            expected = e;
+                        }
+                        try {
+                            authenticator.parseAuthenticationResponse(url, params);
+                            assertTrue(params.toString(), expected == null);
+                        } catch (final SsoStateException e) {
+                            assertTrue(params.toString(), expected != null);
+                            if (expected instanceof IllegalArgumentException) {
+                                illegal++;
+                                assertTrue(e.getMessage(),
+                                        e.getMessage().matches(PARSE_FAILURE + "the (code|scope) parameter (is|has a) blank.*"));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assertTrue("the sweep reached the parser's IllegalArgumentException", illegal > 0);
+    }
+
+    @Test
+    public void test_processAuthenticationData_boundsAndFlattensTheErrorOfACallback() {
+        final EntraIdAuthenticator authenticator = new EntraIdAuthenticator();
+        final MockletHttpServletRequest request = callbackOfOwnSession(authenticator);
+        request.setParameter("error", "access_denied");
+        request.setParameter("error_description", "denied\r\nINJECTED\u2028A\u0085B\u2029C" + "D".repeat(5000));
+        // The parser drops the characters it does not allow in an error description, so what the
+        // message adds is the bound.
+
+        try {
+            authenticator.processAuthenticationData(request);
+            fail("expected SsoStateException");
+        } catch (final SsoStateException e) {
+            assertTrue(e.getMessage(), e.getMessage().startsWith("Request for auth code failed: access_denied - deniedINJECTEDABCD"));
+            assertFalse(e.getMessage(), e.getMessage().matches(LINE_BREAK));
+            assertTrue(e.getMessage(), e.getMessage().endsWith("..."));
+            assertTrue(e.getMessage(), e.getMessage().length() < 400);
+        }
+    }
+
+    @Test
+    public void test_sanitizeForLog() {
+        assertNull(EntraIdAuthenticator.sanitizeForLog(null));
+        assertEquals("", EntraIdAuthenticator.sanitizeForLog(""));
+        assertEquals("access_denied", EntraIdAuthenticator.sanitizeForLog("access_denied"));
+        assertEquals("a b c d e f", EntraIdAuthenticator.sanitizeForLog("a\nb\rc\u0085d\u2028e\u2029f"));
+        assertEquals("a b", EntraIdAuthenticator.sanitizeForLog("a\r\n\u2028\u0000b"));
+        assertEquals("\u65e5\u672c\u8a9e", EntraIdAuthenticator.sanitizeForLog("\u65e5\u672c\u8a9e"));
+        final String atLimit = "x".repeat(EntraIdAuthenticator.MAX_LOGGED_LENGTH);
+        assertEquals(atLimit, EntraIdAuthenticator.sanitizeForLog(atLimit));
+        assertEquals(atLimit + "...", EntraIdAuthenticator.sanitizeForLog(atLimit + "y"));
+        assertEquals(atLimit + "...", EntraIdAuthenticator.sanitizeForLog(atLimit + "y".repeat(5000)));
+    }
+
+    /**
+     * Builds a client application whose token endpoint is the given function, so that no request
+     * leaves the process. instanceDiscovery is off for the same reason: it would ask the real
+     * authority which hosts it trusts.
+     */
+    private EntraIdAuthenticator authenticatorWithTokenEndpoint(final com.microsoft.aad.msal4j.IHttpClient endpoint) {
+        final ConfidentialClientApplication application;
+        try {
+            application = ConfidentialClientApplication
+                    .builder("11111111-1111-1111-1111-111111111111",
+                            com.microsoft.aad.msal4j.ClientCredentialFactory.createFromSecret("secret-1"))
+                    .authority("https://login.microsoftonline.com/contoso.onmicrosoft.com/")
+                    .instanceDiscovery(false)
+                    .httpClient(endpoint)
+                    .build();
+        } catch (final Exception e) {
+            throw new IllegalStateException(e);
+        }
+        return new EntraIdAuthenticator() {
+            @Override
+            protected ConfidentialClientApplication getClientApplication() {
+                return application;
+            }
+        };
+    }
+
+    private static com.microsoft.aad.msal4j.IHttpClient tokenEndpointAnswering(final int status, final String body) {
+        return request -> new com.microsoft.aad.msal4j.HttpResponse().statusCode(status).body(body);
+    }
+
+    @Test
+    public void test_getAccessToken_reportsARefusedAuthorizationCodeAsARejectedRequest() {
+        // A code that expired, was redeemed already or never existed: Entra ID answers 400
+        // invalid_grant. The description carries line breaks, and SsoAction writes one line.
+        final EntraIdAuthenticator authenticator = authenticatorWithTokenEndpoint(tokenEndpointAnswering(400,
+                "{\"error\":\"invalid_grant\",\"error_description\":\"AADSTS70008: The provided authorization code has expired.\\r\\n"
+                        + "Trace ID: abc\\r\\nCorrelation ID: def\",\"error_codes\":[70008]}"));
+        try {
+            authenticator.getAccessToken(new AuthorizationCode("junk-code"), "http://localhost:8080/sso/");
+            fail("expected SsoStateException");
+        } catch (final SsoStateException e) {
+            assertTrue(e.getMessage(), e.getMessage().contains("invalid_grant"));
+            assertTrue(e.getMessage(), e.getMessage().contains("AADSTS70008"));
+            assertTrue(e.getMessage(), e.getMessage().contains("Correlation ID: def"));
+            assertFalse(e.getMessage(), e.getMessage().matches(LINE_BREAK));
+            assertFalse(e.getMessage(), e.getMessage().contains("junk-code"));
+            assertFalse(e.getMessage(), e.getMessage().contains("localhost"));
+        }
+    }
+
+    @Test
+    public void test_getAccessToken_keepsTheDescriptionOfARefusedCodeToOneBoundedLine() {
+        // A realistic description is about 300 characters and keeps its trace and correlation id; a
+        // description that is hostile or huge does not reach the log as it is.
+        final String realistic = "AADSTS70008: The provided authorization code or refresh token has expired due to inactivity. "
+                + "Send a new interactive authorization request for this user and resource.\\r\\n"
+                + "Trace ID: 00000000-0000-0000-0000-000000000000\\r\\nCorrelation ID: 11111111-1111-1111-1111-111111111111\\r\\n"
+                + "Timestamp: 2026-10-11 08:40:01Z";
+        final EntraIdAuthenticator authenticator = authenticatorWithTokenEndpoint(
+                tokenEndpointAnswering(400, "{\"error\":\"invalid_grant\",\"error_description\":\"" + realistic + "\"}"));
+        try {
+            authenticator.getAccessToken(new AuthorizationCode("junk-code"), "http://localhost:8080/sso/");
+            fail("expected SsoStateException");
+        } catch (final SsoStateException e) {
+            assertTrue(e.getMessage(), e.getMessage().contains("Correlation ID: 11111111-1111-1111-1111-111111111111"));
+            assertTrue(e.getMessage(), e.getMessage().contains("Timestamp: 2026-10-11 08:40:01Z"));
+            assertFalse(e.getMessage(), e.getMessage().matches(LINE_BREAK));
+        }
+
+        final EntraIdAuthenticator hostile = authenticatorWithTokenEndpoint(tokenEndpointAnswering(400,
+                "{\"error\":\"invalid_grant\",\"error_description\":\"x\\r\\nINJECTED\\u2028A\\u0085B\\u2029C" + "D".repeat(5000) + "\"}"));
+        try {
+            hostile.getAccessToken(new AuthorizationCode("junk-code"), "http://localhost:8080/sso/");
+            fail("expected SsoStateException");
+        } catch (final SsoStateException e) {
+            assertFalse(e.getMessage(), e.getMessage().matches(LINE_BREAK));
+            assertTrue(e.getMessage(), e.getMessage().length() < "Failed to get a token: invalid_grant - ".length() + 400);
+        }
+    }
+
+    @Test
+    public void test_getAccessToken_keepsTheStackTraceOfEveryOAuthErrorButInvalidGrant() {
+        // invalid_grant is the only answer decided by the code the caller sent. The other OAuth errors,
+        // the 400-class ones included, and a 400 that is not JSON, are decided by this server's
+        // configuration or by the token endpoint, and keep their stack trace.
+        final List<com.microsoft.aad.msal4j.IHttpClient> endpoints = new ArrayList<>();
+        for (final String error : List.of("invalid_request", "invalid_scope", "unauthorized_client", "invalid_client",
+                "unsupported_grant_type", "invalid_grant_extra", "INVALID_GRANT", "interaction_required")) {
+            endpoints.add(tokenEndpointAnswering(400, "{\"error\":\"" + error + "\",\"error_description\":\"AADSTS900144: boom\"}"));
+        }
+        endpoints.add(tokenEndpointAnswering(400, "<html>Bad Request</html>"));
+        endpoints.add(tokenEndpointAnswering(400, ""));
+        for (final com.microsoft.aad.msal4j.IHttpClient endpoint : endpoints) {
+            final EntraIdAuthenticator authenticator = authenticatorWithTokenEndpoint(endpoint);
+            final SsoLoginException e = org.junit.jupiter.api.Assertions.assertThrows(SsoLoginException.class,
+                    () -> authenticator.getAccessToken(new AuthorizationCode("junk-code"), "http://localhost:8080/sso/"));
+            assertFalse(e.toString(), e instanceof SsoStateException);
+        }
+    }
+
+    @Test
+    public void test_findRejectedGrant_matchesOnlyTheExactErrorCode() {
+        final EntraIdAuthenticator authenticator = new EntraIdAuthenticator();
+        final com.microsoft.aad.msal4j.MsalServiceException grant = new com.microsoft.aad.msal4j.MsalServiceException("m", "invalid_grant");
+        assertSame(grant, authenticator.findRejectedGrant(grant));
+        assertSame(grant, authenticator.findRejectedGrant(new java.util.concurrent.ExecutionException(new RuntimeException(grant))));
+        assertNull(authenticator.findRejectedGrant(new com.microsoft.aad.msal4j.MsalServiceException("m", "invalid_client")));
+        assertNull(authenticator.findRejectedGrant(new com.microsoft.aad.msal4j.MsalServiceException("invalid_grant", "invalid_request")));
+        assertNull(authenticator.findRejectedGrant(new RuntimeException("invalid_grant")));
+        assertNull(authenticator.findRejectedGrant(null));
+    }
+
+    @Test
+    public void test_getAccessToken_keepsTheStackTraceOfAFaultOfThisServer() {
+        // These are not decided by the code the caller sent: this server's own credentials are
+        // refused, the token endpoint fails, it answers with something that is not JSON, or it
+        // cannot be reached. They stay SsoLoginException, which SsoAction logs with the stack trace.
+        final List<com.microsoft.aad.msal4j.IHttpClient> endpoints = List.of(
+                tokenEndpointAnswering(401,
+                        "{\"error\":\"invalid_client\",\"error_description\":\"AADSTS7000215: Invalid client secret.\"}"),
+                tokenEndpointAnswering(500, "{\"error\":\"server_error\",\"error_description\":\"boom\"}"),
+                tokenEndpointAnswering(200, "<html>"), request -> {
+                    throw new IOException("connection refused");
+                });
+        for (final com.microsoft.aad.msal4j.IHttpClient endpoint : endpoints) {
+            final EntraIdAuthenticator authenticator = authenticatorWithTokenEndpoint(endpoint);
+            final SsoLoginException e = org.junit.jupiter.api.Assertions.assertThrows(SsoLoginException.class,
+                    () -> authenticator.getAccessToken(new AuthorizationCode("junk-code"), "http://localhost:8080/sso/"));
+            assertFalse(e.toString(), e instanceof SsoStateException);
+        }
     }
 }

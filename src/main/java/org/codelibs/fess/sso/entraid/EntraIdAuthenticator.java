@@ -19,6 +19,7 @@ import static org.codelibs.core.stream.StreamUtil.split;
 
 import java.io.IOException;
 import java.net.URI;
+import java.net.URISyntaxException;
 import java.net.URLEncoder;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -35,6 +36,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 import org.apache.logging.log4j.LogManager;
@@ -72,11 +74,13 @@ import com.microsoft.aad.msal4j.AuthorizationCodeParameters;
 import com.microsoft.aad.msal4j.ConfidentialClientApplication;
 import com.microsoft.aad.msal4j.IAccount;
 import com.microsoft.aad.msal4j.IAuthenticationResult;
+import com.microsoft.aad.msal4j.MsalServiceException;
 import com.microsoft.aad.msal4j.RefreshTokenParameters;
 import com.microsoft.aad.msal4j.SilentParameters;
 import com.nimbusds.jwt.JWTClaimsSet;
 import com.nimbusds.jwt.JWTParser;
 import com.nimbusds.oauth2.sdk.AuthorizationCode;
+import com.nimbusds.oauth2.sdk.ParseException;
 import com.nimbusds.openid.connect.sdk.AuthenticationErrorResponse;
 import com.nimbusds.openid.connect.sdk.AuthenticationResponse;
 import com.nimbusds.openid.connect.sdk.AuthenticationResponseParser;
@@ -100,6 +104,15 @@ public class EntraIdAuthenticator implements SsoAuthenticator {
     public EntraIdAuthenticator() {
         // Default constructor
     }
+
+    /**
+     * The longest text from outside this server that is written to the log as is; a longer one is cut.
+     * An Entra ID error description with its trace, correlation id and timestamp is about 300 characters.
+     */
+    protected static final int MAX_LOGGED_LENGTH = 300;
+
+    /** Control characters, and the Unicode line and paragraph separators that {@code \p{Cntrl}} does not cover. */
+    private static final Pattern UNSAFE_LOG_CHARS = Pattern.compile("[\\p{Cntrl}\\u0085\\u2028\\u2029]+");
 
     // New configuration keys for Entra ID
     /** Configuration key for Entra ID state time-to-live. */
@@ -668,8 +681,8 @@ public class EntraIdAuthenticator implements SsoAuthenticator {
         // An SsoStateException: the error comes with a callback of the caller's own session (the state
         // was validated above), which anyone can send, and nothing has been redeemed yet. SsoAction logs
         // it as one line, so the message must not carry line breaks that the caller supplied.
-        throw new SsoStateException(String.format("Request for auth code failed: %s - %s", oidcResponse.getErrorObject().getCode(),
-                oidcResponse.getErrorObject().getDescription()).replaceAll("\\p{Cntrl}+", " "));
+        throw new SsoStateException("Request for auth code failed: " + sanitizeForLog(oidcResponse.getErrorObject().getCode()) + " - "
+                + sanitizeForLog(oidcResponse.getErrorObject().getDescription()));
     }
 
     /**
@@ -683,10 +696,76 @@ public class EntraIdAuthenticator implements SsoAuthenticator {
             logger.debug("Parse: {} : {}", maskQueryString(url), maskParams(params));
         }
         try {
+            rejectBlankValues(params);
             return AuthenticationResponseParser.parse(new URI(url), params);
+        } catch (final SsoStateException e) {
+            throw e;
+        } catch (final ParseException e) {
+            // An SsoStateException: the parser refused what the caller sent with a callback of the
+            // caller's own session, and nothing has been redeemed yet. SsoAction logs it as one line
+            // without the cause, so the reason goes into the message. Any other exception is not
+            // known to come from the input, so it keeps its stack trace (the last catch).
+            throw new SsoStateException("Failed to parse an authentication response: " + sanitizeForLog(e.getMessage()), e);
+        } catch (final URISyntaxException e) {
+            // Only the reason: the message of a URISyntaxException quotes the whole URL, which carries
+            // the authorization code.
+            throw new SsoStateException("Failed to parse an authentication response: " + sanitizeForLog(e.getReason()), e);
         } catch (final Exception e) {
             throw new SsoLoginException("Failed to parse an authentication response.", e);
         }
+    }
+
+    /**
+     * Rejects the callback values with which the parser throws an {@link IllegalArgumentException}
+     * instead of a {@link ParseException}, so that they are reported as the input they are and not
+     * as a defect. The parser builds the authorization code, and the entries of a scope that comes
+     * with an access token, from the value without checking it, and refuses a blank one that way.
+     * This covers exactly those cases and leaves every other callback to the parser: nothing the
+     * parser accepts is rejected here, and nothing else is reclassified. The text names the parameter
+     * and never its value.
+     *
+     * @param params The response parameters.
+     * @throws SsoStateException If the code, or an entry of the scope that comes with an access token, is blank.
+     */
+    protected void rejectBlankValues(final Map<String, List<String>> params) {
+        if (!isBlankOrAbsent(firstValue(params, ERROR))) {
+            return; // an error response: the code and the scope are not read
+        }
+        final String code = firstValue(params, CODE);
+        if (code != null && code.isBlank()) {
+            throw new SsoStateException("Failed to parse an authentication response: the " + CODE + " parameter is blank");
+        }
+        final String scope = firstValue(params, "scope");
+        if (scope != null && !isBlankOrAbsent(firstValue(params, "access_token")) && !scope.trim().isEmpty()
+                && Arrays.stream(scope.split(" ")).anyMatch(entry -> !entry.isEmpty() && entry.isBlank())) {
+            throw new SsoStateException("Failed to parse an authentication response: the scope parameter has a blank entry");
+        }
+    }
+
+    private static String firstValue(final Map<String, List<String>> params, final String name) {
+        final List<String> values = params.get(name);
+        return values == null || values.isEmpty() ? null : values.get(0);
+    }
+
+    private static boolean isBlankOrAbsent(final String value) {
+        return value == null || value.isBlank();
+    }
+
+    /**
+     * Makes text that does not come from this server safe to embed in a log message. The callback
+     * endpoint is anonymous and the application log is one event per line, so a line break in a
+     * logged value would let any caller start a log line of their own. Every run of control and
+     * line-separator characters is replaced by a space, and a longer text is cut.
+     *
+     * @param text The text, which may be null.
+     * @return The text to log, or null if the text is null.
+     */
+    protected static String sanitizeForLog(final String text) {
+        if (text == null) {
+            return null;
+        }
+        final String bounded = text.length() > MAX_LOGGED_LENGTH ? text.substring(0, MAX_LOGGED_LENGTH) + "..." : text;
+        return UNSAFE_LOG_CHARS.matcher(bounded).replaceAll(" ");
     }
 
     /**
@@ -886,8 +965,41 @@ public class EntraIdAuthenticator implements SsoAuthenticator {
             trackAccount(result);
             return result;
         } catch (final Exception e) {
+            final MsalServiceException rejection = findRejectedGrant(e);
+            if (rejection != null) {
+                // An SsoStateException: Entra ID refused the authorization code itself (expired, already
+                // redeemed, or never issued). Anyone can send a callback of their own session with such a
+                // code, so SsoAction logs it as one line. A token endpoint that cannot be reached, or that
+                // refuses this server's own credentials, is a fault and keeps its stack trace.
+                throw new SsoStateException(
+                        "Failed to get a token: " + sanitizeForLog(rejection.errorCode()) + " - " + sanitizeForLog(rejection.getMessage()),
+                        e);
+            }
             throw new SsoLoginException("Failed to get a token.", e);
         }
+    }
+
+    /**
+     * Finds the {@code invalid_grant} answer of the token endpoint in the cause chain of a failed token request.
+     *
+     * <p>This is the whole boundary between a rejected request and a fault of this server, and it is an exact
+     * match on the OAuth {@code error} value that {@link MsalServiceException#errorCode()} carries.
+     * {@code invalid_grant} is the one answer decided by the authorization code the caller sent (expired,
+     * already redeemed, or never issued). Every other answer, including the other 400-class ones
+     * ({@code invalid_request}, {@code invalid_scope}, {@code unauthorized_client}, {@code invalid_client}) and a
+     * 400 whose body is not JSON, is decided by this server's configuration or by the token endpoint, and keeps
+     * its stack trace. Do not widen the match to a status code or to an error family.
+     *
+     * @param e The failure of the token request.
+     * @return The service exception that carries {@code invalid_grant}, or null when the failure is anything else.
+     */
+    protected MsalServiceException findRejectedGrant(final Throwable e) {
+        for (Throwable t = e; t != null; t = t.getCause()) {
+            if (t instanceof final MsalServiceException m && "invalid_grant".equals(m.errorCode())) {
+                return m;
+            }
+        }
+        return null;
     }
 
     /**
