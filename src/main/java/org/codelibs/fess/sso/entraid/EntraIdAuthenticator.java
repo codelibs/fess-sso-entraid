@@ -499,7 +499,9 @@ public class EntraIdAuthenticator implements SsoAuthenticator {
             missing.add(ENTRAID_CLIENT_SECRET);
         }
         if (!missing.isEmpty()) {
-            throw new SsoLoginException("Entra ID is not configured. The following settings are empty: " + String.join(", ", missing));
+            // An SsoStateException, so that SsoAction logs one line: any anonymous request to /sso/
+            // reaches this on an unconfigured server, and the stack trace says nothing the message does not.
+            throw new SsoStateException("Entra ID is not configured. The following settings are empty: " + String.join(", ", missing));
         }
     }
 
@@ -663,8 +665,11 @@ public class EntraIdAuthenticator implements SsoAuthenticator {
             return new EntraIdCredential(authData);
         }
         final AuthenticationErrorResponse oidcResponse = (AuthenticationErrorResponse) authResponse;
-        throw new SsoLoginException(String.format("Request for auth code failed: %s - %s", oidcResponse.getErrorObject().getCode(),
-                oidcResponse.getErrorObject().getDescription()));
+        // An SsoStateException: the error comes with a callback of the caller's own session (the state
+        // was validated above), which anyone can send, and nothing has been redeemed yet. SsoAction logs
+        // it as one line, so the message must not carry line breaks that the caller supplied.
+        throw new SsoStateException(String.format("Request for auth code failed: %s - %s", oidcResponse.getErrorObject().getCode(),
+                oidcResponse.getErrorObject().getDescription()).replaceAll("\\p{Cntrl}+", " "));
     }
 
     /**
@@ -917,7 +922,9 @@ public class EntraIdAuthenticator implements SsoAuthenticator {
      */
     protected void validateAuthRespMatchesCodeFlow(final AuthenticationSuccessResponse oidcResponse) {
         if (oidcResponse.getIDToken() != null || oidcResponse.getAccessToken() != null || oidcResponse.getAuthorizationCode() == null) {
-            throw new SsoLoginException("unexpected set of artifacts received");
+            // An SsoStateException: a callback of the caller's own session whose artifacts are not
+            // those of the code flow. Anyone can send it, so SsoAction logs it as one line.
+            throw new SsoStateException("unexpected set of artifacts received");
         }
     }
 

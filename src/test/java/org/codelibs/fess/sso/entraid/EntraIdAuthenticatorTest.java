@@ -21,6 +21,7 @@ import java.lang.reflect.Method;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
+import java.net.URI;
 import java.net.URLDecoder;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
@@ -71,6 +72,9 @@ import com.microsoft.aad.msal4j.ConfidentialClientApplication;
 import com.microsoft.aad.msal4j.IAccount;
 import com.microsoft.aad.msal4j.IAuthenticationResult;
 import com.microsoft.aad.msal4j.ITenantProfile;
+import com.nimbusds.oauth2.sdk.id.State;
+import com.nimbusds.oauth2.sdk.token.BearerAccessToken;
+import com.nimbusds.openid.connect.sdk.AuthenticationSuccessResponse;
 import com.sun.net.httpserver.HttpServer;
 
 public class EntraIdAuthenticatorTest extends UnitFessTestCase {
@@ -710,8 +714,8 @@ public class EntraIdAuthenticatorTest extends UnitFessTestCase {
 
         try {
             authenticator.getLoginCredential();
-            fail("expected SsoLoginException");
-        } catch (final SsoLoginException e) {
+            fail("expected SsoStateException");
+        } catch (final SsoStateException e) {
             assertTrue(e.getMessage(), e.getMessage().contains("entraid.tenant"));
             assertTrue(e.getMessage(), e.getMessage().contains("entraid.client.id"));
             assertTrue(e.getMessage(), e.getMessage().contains("entraid.client.secret"));
@@ -728,8 +732,8 @@ public class EntraIdAuthenticatorTest extends UnitFessTestCase {
             setEntraIdConfig("11111111-1111-1111-1111-111111111111", "secret-1", "");
 
             authenticator.getLoginCredential();
-            fail("expected SsoLoginException");
-        } catch (final SsoLoginException e) {
+            fail("expected SsoStateException");
+        } catch (final SsoStateException e) {
             assertTrue(e.getMessage(), e.getMessage().contains("entraid.tenant"));
             assertFalse(e.getMessage(), e.getMessage().contains("entraid.client.id"));
         } finally {
@@ -752,7 +756,9 @@ public class EntraIdAuthenticatorTest extends UnitFessTestCase {
             authenticator.getLoginCredential();
             fail("expected SsoLoginException before any credential was returned");
         } catch (final SsoLoginException e) {
-            // expected
+            // SsoAction logs an SsoStateException as one line: the endpoint is anonymous, so a
+            // stack trace per request would let any client fill the log of an unconfigured server.
+            assertTrue(e.toString(), e instanceof SsoStateException);
         }
     }
 
@@ -2255,6 +2261,46 @@ public class EntraIdAuthenticatorTest extends UnitFessTestCase {
             fail("expected SsoStateException");
         } catch (final SsoStateException e) {
             assertEquals("could not validate state", e.getMessage());
+        }
+    }
+
+    @Test
+    public void test_validateAuthRespMatchesCodeFlow_reportsUnexpectedArtifactsAsARejectedRequest() throws Exception {
+        // The callback carries a state this server issued, but the artifacts are not the ones of
+        // the code flow. Anyone can send that, so it is not logged with a stack trace.
+        final EntraIdAuthenticator authenticator = new EntraIdAuthenticator();
+        final AuthenticationSuccessResponse implicitResponse = new AuthenticationSuccessResponse(new URI("http://localhost:8080/sso/"),
+                null, null, new BearerAccessToken(), new State("state"), null, null);
+        try {
+            authenticator.validateAuthRespMatchesCodeFlow(implicitResponse);
+            fail("expected SsoStateException");
+        } catch (final SsoStateException e) {
+            assertEquals("unexpected set of artifacts received", e.getMessage());
+        }
+    }
+
+    @Test
+    public void test_processAuthenticationData_reportsAnErrorResponseAsARejectedRequest() {
+        // An error response (access_denied, consent_required, ...) is sent by the browser of
+        // whoever started the login, so it is not a fault of this server.
+        ComponentUtil.register(new SystemHelper(), "systemHelper");
+        final EntraIdAuthenticator authenticator = new EntraIdAuthenticator();
+        final MockletHttpServletRequest request = getMockRequest();
+        request.setMethod("GET");
+        final String state = URLDecoder.decode(authenticator.getAuthUrl(request).replaceFirst("(?s).*[&?]state=([^&]*).*", "$1"),
+                StandardCharsets.UTF_8);
+        request.setParameter("state", state);
+        request.setParameter("error", "access_denied");
+        request.setParameter("error_description", "The user cancelled the login.\r\nforged log line");
+
+        try {
+            authenticator.processAuthenticationData(request);
+            fail("expected SsoStateException");
+        } catch (final SsoStateException e) {
+            assertTrue(e.getMessage(), e.getMessage().contains("access_denied"));
+            // the description comes from the caller, and SsoAction writes the message as one log line
+            assertFalse(e.getMessage(), e.getMessage().matches("(?s).*[\\r\\n].*"));
+            assertTrue(e.getMessage(), e.getMessage().contains("forged log line"));
         }
     }
 
