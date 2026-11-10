@@ -20,12 +20,15 @@ import java.util.Collections;
 import java.util.Date;
 import java.util.Map;
 
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.codelibs.core.lang.StringUtil;
 import org.codelibs.fess.entity.FessUser.PermissionState;
 import org.codelibs.fess.session.SessionDataSerializer;
 import org.codelibs.fess.sso.entraid.EntraIdAuthenticator.StateData;
 import org.codelibs.fess.sso.entraid.EntraIdCredential.EntraIdUser;
 import org.codelibs.fess.util.ComponentUtil;
+import org.codelibs.fess.util.LogUtil;
 
 import com.esotericsoftware.kryo.Kryo;
 import com.esotericsoftware.kryo.Serializer;
@@ -56,6 +59,11 @@ import jakarta.annotation.PostConstruct;
  */
 public class EntraIdSessionSerializers {
 
+    private static final Logger logger = LogManager.getLogger(EntraIdSessionSerializers.class);
+
+    /** The name of the component of Fess that serializes the attributes of a session for the session store. */
+    protected static final String SESSION_DATA_SERIALIZER = "sessionDataSerializer";
+
     /** The layout of the bytes of a user. A reader of another layout refuses the user instead of misreading it. */
     protected static final int USER_FORMAT = 1;
 
@@ -82,15 +90,23 @@ public class EntraIdSessionSerializers {
     }
 
     /**
-     * Registers the serializers. It fails the start of the container when the registrations of the session
-     * store are fixed already, because a node that silently kept the classes out would disagree with the
-     * others on the format of the session and be logged out of every session.
+     * Registers the serializers. A registration that is refused does not stop the start of the container: the
+     * registrations of the session store may be fixed already, the store may be absent, or the classes may be
+     * registered already. Fess then boots and keeps the Entra ID login and its authorization state in the
+     * session of the node that handled them, as the SAML and OpenID Connect plugins do. A warning is logged once.
      */
     @PostConstruct
     public void register() {
-        final SessionDataSerializer serializer = ComponentUtil.getComponent("sessionDataSerializer");
-        serializer.register(EntraIdUser.class, new EntraIdUserSerializer());
-        serializer.register(StateData.class, new StateDataSerializer());
+        try {
+            if (!ComponentUtil.hasComponent(SESSION_DATA_SERIALIZER)) {
+                throw new IllegalStateException("The component " + SESSION_DATA_SERIALIZER + " is not available.");
+            }
+            final SessionDataSerializer serializer = ComponentUtil.getComponent(SESSION_DATA_SERIALIZER);
+            serializer.register(EntraIdUser.class, new EntraIdUserSerializer());
+            serializer.register(StateData.class, new StateDataSerializer());
+        } catch (final RuntimeException e) {
+            LogUtil.warnOnce(logger, "register", "Entra ID sessions are not shared between nodes by the session store: {}", e.toString());
+        }
     }
 
     // ===================================================================================

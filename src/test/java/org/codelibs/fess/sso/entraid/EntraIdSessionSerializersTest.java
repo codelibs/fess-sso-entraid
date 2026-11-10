@@ -15,6 +15,7 @@
  */
 package org.codelibs.fess.sso.entraid;
 
+import java.lang.reflect.Field;
 import java.lang.reflect.Proxy;
 import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
@@ -30,6 +31,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
+import org.apache.logging.log4j.LogManager;
 import org.codelibs.fess.entity.FessUser.PermissionState;
 import org.codelibs.fess.exception.SsoStateException;
 import org.codelibs.fess.helper.SystemHelper;
@@ -39,6 +41,7 @@ import org.codelibs.fess.sso.entraid.EntraIdAuthenticator.StateData;
 import org.codelibs.fess.sso.entraid.EntraIdCredential.EntraIdUser;
 import org.codelibs.fess.unit.UnitFessTestCase;
 import org.codelibs.fess.util.ComponentUtil;
+import org.codelibs.fess.util.LogUtil;
 import org.junit.jupiter.api.Test;
 
 import com.esotericsoftware.kryo.Kryo;
@@ -704,12 +707,37 @@ public class EntraIdSessionSerializersTest extends UnitFessTestCase {
         final Probe serializer = newSerializer();
         assertFalse(before.equals(serializer.getFormatVersion()));
 
-        // a second registration is refused by the store, and so is one after the registrations are fixed
-        try {
-            new EntraIdSessionSerializers().register();
-            fail("registered twice");
-        } catch (final IllegalArgumentException | IllegalStateException expected) {
-            // refused
-        }
+        // a second registration is refused by the store, but that must not stop the start of Fess
+        LogUtil.resetWarnOnce();
+        new EntraIdSessionSerializers().register();
+        assertWarned();
+    }
+
+    @Test
+    public void test_register_afterTheStoreIsLockedDoesNotThrowAndWarnsOnce() {
+        LogUtil.resetWarnOnce();
+        final Probe probe = new Probe();
+        probe.getFormatVersion(); // fixes the registrations
+        ComponentUtil.register(probe, "sessionDataSerializer");
+        new EntraIdSessionSerializers().register();
+        assertWarned();
+    }
+
+    @Test
+    public void test_register_withoutTheSerializerComponentDoesNotThrowAndWarnsOnce() throws Exception {
+        LogUtil.resetWarnOnce();
+        final Field field = ComponentUtil.class.getDeclaredField("componentMap");
+        field.setAccessible(true);
+        @SuppressWarnings("unchecked")
+        final Map<String, Object> componentMap = (Map<String, Object>) field.get(null);
+        componentMap.remove("sessionDataSerializer");
+        assertFalse(ComponentUtil.hasComponent("sessionDataSerializer"));
+        new EntraIdSessionSerializers().register();
+        assertWarned();
+    }
+
+    /** The warning was logged already by the registration, so asking to log it again is refused. */
+    private void assertWarned() {
+        assertFalse(LogUtil.warnOnce(LogManager.getLogger(EntraIdSessionSerializers.class), "register", "again"));
     }
 }
