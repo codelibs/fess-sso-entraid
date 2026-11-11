@@ -153,6 +153,13 @@ public class EntraIdCredential implements LoginCredential, FessCredential {
         protected volatile long renewalThrottledUntil;
 
         /**
+         * The user's object id, once it is known. Read out of the ID token on first use and then
+         * kept, because the ID token itself is not what a session shared between nodes carries: a
+         * user restored from the shared session holds no ID token, only this value.
+         */
+        protected volatile String objectId;
+
+        /**
          * Constructs an Entra ID user with the authentication result.
          * @param authResult The authentication result from Entra ID.
          */
@@ -165,6 +172,21 @@ public class EntraIdCredential implements LoginCredential, FessCredential {
             // first results a user sees are those of someone holding no groups at all.
             authenticator.applyDefaultMemberships(this);
             authenticator.scheduleUpdateMemberOf(this);
+        }
+
+        /**
+         * Constructs an Entra ID user that is restored from a session shared between nodes, see
+         * {@code EntraIdSessionSerializers}. Unlike the public constructor it neither seeds the
+         * configured defaults nor schedules a membership resolution: the caller sets the memberships
+         * and the state that were resolved on the node that handled the login, and a resolution
+         * here would reach Microsoft Graph without an access token.
+         *
+         * @param authResult The restored authentication result, which holds no tokens.
+         * @param objectId The user's object id, or null.
+         */
+        protected EntraIdUser(final IAuthenticationResult authResult, final String objectId) {
+            this.authResult = authResult;
+            this.objectId = objectId;
         }
 
         @Override
@@ -230,6 +252,10 @@ public class EntraIdCredential implements LoginCredential, FessCredential {
          * @return The object id, or null when the ID token carries none.
          */
         protected String getObjectId() {
+            final String known = objectId;
+            if (known != null) {
+                return known;
+            }
             final String idToken = authResult.idToken();
             if (StringUtil.isBlank(idToken)) {
                 logger.warn("No ID token for {}. The object id permission is not granted.", getName());
@@ -238,7 +264,8 @@ public class EntraIdCredential implements LoginCredential, FessCredential {
             try {
                 final JWTClaimsSet claimsSet = JWTParser.parse(idToken).getJWTClaimsSet();
                 if (claimsSet != null) {
-                    return claimsSet.getStringClaim("oid");
+                    objectId = claimsSet.getStringClaim("oid");
+                    return objectId;
                 }
                 logger.warn("The ID token of {} carries no claims. The object id permission is not granted.", getName());
             } catch (final Exception e) {

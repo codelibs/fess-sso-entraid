@@ -22,4 +22,10 @@
 		<property name="maxCachedAccounts">10000</property>
 		-->
 	</component>
+
+	<!-- Registers EntraIdUser and the authorization state with sessionDataSerializer, so that the
+	     OpenSearch-backed session store (FESS_SESSION_STORE=opensearch) can share them between nodes.
+	     Inert when that store is not selected. The name is prefixed because every fess-sso-* jar
+	     contributes to the same merged file. -->
+	<component name="entraidSessionSerializers" class="org.codelibs.fess.sso.entraid.EntraIdSessionSerializers" />
 </components>
