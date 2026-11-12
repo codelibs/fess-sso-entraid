@@ -223,6 +223,13 @@ public class EntraIdSessionSerializers {
      */
     protected static class EntraIdUserSerializer extends Serializer<EntraIdUser> {
 
+        /**
+         * Default constructor.
+         */
+        protected EntraIdUserSerializer() {
+            // nothing to do
+        }
+
         @Override
         public void write(final Kryo kryo, final Output output, final EntraIdUser user) {
             // The state first: the resolution writes the memberships and only then the state.
@@ -305,6 +312,13 @@ public class EntraIdSessionSerializers {
      */
     protected static class StateDataSerializer extends Serializer<StateData> {
 
+        /**
+         * Default constructor.
+         */
+        protected StateDataSerializer() {
+            // nothing to do
+        }
+
         @Override
         public void write(final Kryo kryo, final Output output, final StateData stateData) {
             output.writeVarInt(STATE_FORMAT, true);
@@ -336,10 +350,13 @@ public class EntraIdSessionSerializers {
 
         private static final long serialVersionUID = 1L;
 
+        /** The user name of the account. */
         private final String username;
 
+        /** The home account id, or null. */
         private final String homeAccountId;
 
+        /** The environment, or null. */
         private final String environment;
 
         /**
@@ -384,8 +401,10 @@ public class EntraIdSessionSerializers {
 
         private static final long serialVersionUID = 1L;
 
+        /** The account of the restored user. */
         private final IAccount account;
 
+        /** When the access token that the user had expires, in epoch milliseconds. */
         private final long expiresOn;
 
         /**
