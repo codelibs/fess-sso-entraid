@@ -99,6 +99,16 @@ Fess merges from every jar on the class path:
   `sso.type=entraid` resolve. It is a singleton, because the authenticator registers that
   instance with `ssoManager` from its `init()`.
 
+When Fess keeps its HTTP sessions in OpenSearch (`FESS_SESSION_STORE=opensearch`), the plugin also
+registers the logged-in user and the state of the authorization requests with the session store, so a
+login started on one node can end on another and the user stays logged in on all of them. No token and
+no client secret is stored. Run the same plugins on every node: the stored format depends on the
+registered classes, and a node with a different set does not read the sessions of the others. This needs
+the plugin 15.10 on every node. Adding or removing an SSO plugin changes that set, so it invalidates the
+stored sessions: users log in again. A user restored on another node keeps the memberships resolved at
+login but cannot call Microsoft Graph from there, because the tokens stay with the node that handled the
+login.
+
 The `SsoAuthenticator` interface, `SsoManager`, `SsoAction` and the SSO section of the
 administration screen remain in Fess; only this authenticator, the credential it hands to
 `FessLoginAssist`, and the libraries they compile against ship here. MSAL4J and the Nimbus SDK
