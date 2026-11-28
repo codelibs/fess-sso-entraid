@@ -42,6 +42,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 
+import org.apache.logging.log4j.Level;
 import org.codelibs.core.misc.Pair;
 import org.codelibs.curl.Curl;
 import org.codelibs.curl.CurlResponse;
@@ -499,8 +500,9 @@ public class EntraIdAuthenticatorTest extends UnitFessTestCase {
         // Credentials are truncated.
         assertEquals(List.of("0.AXkAau***"), masked.get("code"));
         assertEquals(List.of("eyJ0eXAi***"), masked.get("id_token"));
+        // The state ties the callback to the session until it is answered, so it is truncated too.
+        assertEquals(List.of("2b1f5c3e***"), masked.get("state"));
         // Everything needed to diagnose a failed login is kept verbatim.
-        assertEquals(List.of("2b1f5c3e-0000-0000-0000-000000000000"), masked.get("state"));
         assertEquals(List.of("access_denied"), masked.get("error"));
         assertEquals(List.of("AADSTS65004: User declined to consent."), masked.get("error_description"));
         // The key set is unchanged, so the log still shows which artifacts arrived.
@@ -519,6 +521,62 @@ public class EntraIdAuthenticatorTest extends UnitFessTestCase {
 
         assertEquals(List.of("0.AXkAau***"), masked.get("Code"));
         assertEquals(List.of("accessto***"), masked.get("ACCESS_TOKEN"));
+    }
+
+    @Test
+    public void test_stateData_toStringMasksTheNonce() {
+        final String text = new EntraIdAuthenticator.StateData("8f0c2a1d-0000-0000-0000-000000000000", 123L).toString();
+
+        assertFalse(text, text.contains("8f0c2a1d-0000-0000-0000-000000000000"));
+        assertTrue(text, text.contains("8f0c2a1d***"));
+        assertTrue(text, text.contains("123"));
+    }
+
+    @Test
+    public void test_debugLog_doesNotCarryTheStateOrTheNonce() {
+        // The login is driven from the authorization request to the callback with DEBUG on: none of
+        // the lines along the way may hold the whole state or nonce, only their truncated prefix.
+        ComponentUtil.register(new SystemHelper(), "systemHelper");
+        final EntraIdAuthenticator authenticator = new EntraIdAuthenticator();
+        // A second login evicts the first state, so the eviction line is written too.
+        authenticator.setMaxStates(1);
+        final MockletHttpServletRequest request = getMockRequest();
+        request.setMethod("GET");
+        final LogCapturingAppender logs = LogCapturingAppender.attach(EntraIdAuthenticator.class);
+        try {
+            final String firstUrl = authenticator.getAuthUrl(request);
+            final String secondUrl = authenticator.getAuthUrl(request);
+            final String firstState = firstUrl.replaceFirst("(?s).*[&?]state=([^&]*).*", "$1");
+            final String firstNonce = firstUrl.replaceFirst("(?s).*&nonce=([^&]*).*", "$1");
+            final String state = secondUrl.replaceFirst("(?s).*[&?]state=([^&]*).*", "$1");
+            final String nonce = secondUrl.replaceFirst("(?s).*&nonce=([^&]*).*", "$1");
+            request.setParameter("state", state);
+            request.setParameter("error", "access_denied");
+            try {
+                authenticator.processAuthenticationData(request);
+                fail("expected SsoStateException");
+            } catch (final SsoStateException e) {
+                // the error response of the callback
+            }
+
+            // Every level and any attached throwable, not only the DEBUG messages.
+            final List<String> rendered = logs.renderedEvents();
+            for (final String secret : List.of(firstState, firstNonce, state, nonce)) {
+                assertFalse(secret + " in " + rendered, rendered.stream().anyMatch(m -> m.contains(secret)));
+            }
+            final List<String> debug = logs.messagesAt(Level.DEBUG);
+            // The lines are still written, with enough of each value to follow one login through the log.
+            assertTrue(debug.toString(), debug.stream()
+                    .anyMatch(m -> m.startsWith("redirect to: ") && m.contains("&client_id=") && m.endsWith(
+                            "&state=" + EntraIdAuthenticator.maskSecret(state) + "&nonce=" + EntraIdAuthenticator.maskSecret(nonce))));
+            assertTrue(debug.toString(), debug.contains("Removing surplus state: " + EntraIdAuthenticator.maskSecret(firstState)));
+            assertTrue(debug.toString(),
+                    debug.stream().anyMatch(m -> m.startsWith("Loading state: ") && m.contains(EntraIdAuthenticator.maskSecret(nonce))));
+            assertTrue(debug.toString(), debug.stream()
+                    .anyMatch(m -> m.startsWith("Parse: ") && m.contains("state=[" + EntraIdAuthenticator.maskSecret(state) + "]")));
+        } finally {
+            logs.detach();
+        }
     }
 
     @Test
@@ -874,6 +932,25 @@ public class EntraIdAuthenticatorTest extends UnitFessTestCase {
         final Map<String, EntraIdAuthenticator.StateData> stateMap = authenticator.getStateMap(session);
         assertEquals(1, stateMap.size());
         assertTrue(stateMap.containsKey("state-2"));
+    }
+
+    @Test
+    public void test_removeExpiredStates_masksTheStateInTheDebugLog() {
+        final EntraIdAuthenticator authenticator = newAuthenticatorWithControlledClock();
+        final HttpSession session = getMockRequest().getSession();
+        authenticator.storeStateInSession(session, "expired-state-value", "nonce-1");
+        clock.addAndGet(3601L * 1000L);
+
+        final LogCapturingAppender logs = LogCapturingAppender.attach(EntraIdAuthenticator.class);
+        try {
+            authenticator.storeStateInSession(session, "state-2", "nonce-2");
+
+            final List<String> debug = logs.messagesAt(Level.DEBUG);
+            assertTrue(debug.toString(), debug.contains("Removing old state: expired-***"));
+            assertFalse(debug.toString(), debug.stream().anyMatch(m -> m.contains("expired-state-value")));
+        } finally {
+            logs.detach();
+        }
     }
 
     @Test
@@ -2315,6 +2392,22 @@ public class EntraIdAuthenticatorTest extends UnitFessTestCase {
             fail("expected SsoStateException");
         } catch (final SsoStateException e) {
             assertEquals("could not validate nonce", e.getMessage());
+        }
+    }
+
+    @Test
+    public void test_validateNonce_masksTheNonceInTheDebugLog() {
+        final EntraIdAuthenticator authenticator = new EntraIdAuthenticator();
+        final LogCapturingAppender logs = LogCapturingAppender.attach(EntraIdAuthenticator.class);
+        try {
+            authenticator.validateNonce(new EntraIdAuthenticator.StateData("expected-nonce", 0L),
+                    new TestAuthenticationResult(new TestAccount(), plainIdToken("expected-nonce")));
+
+            final List<String> debug = logs.messagesAt(Level.DEBUG);
+            assertTrue(debug.toString(), debug.contains("nonce=expected***"));
+            assertFalse(debug.toString(), debug.stream().anyMatch(m -> m.contains("expected-nonce")));
+        } finally {
+            logs.detach();
         }
     }
 
