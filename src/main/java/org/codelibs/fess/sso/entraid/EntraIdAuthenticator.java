@@ -74,6 +74,7 @@ import com.microsoft.aad.msal4j.AuthorizationCodeParameters;
 import com.microsoft.aad.msal4j.ConfidentialClientApplication;
 import com.microsoft.aad.msal4j.IAccount;
 import com.microsoft.aad.msal4j.IAuthenticationResult;
+import com.microsoft.aad.msal4j.MsalInteractionRequiredException;
 import com.microsoft.aad.msal4j.MsalServiceException;
 import com.microsoft.aad.msal4j.RefreshTokenParameters;
 import com.microsoft.aad.msal4j.SilentParameters;
@@ -1003,9 +1004,38 @@ public class EntraIdAuthenticator implements SsoAuthenticator {
     }
 
     /**
+     * Finds the answer of Entra ID that refuses to renew a user's tokens in the cause chain of a failed silent
+     * acquisition: the account has to sign in again.
+     *
+     * <p>That is a {@link MsalInteractionRequiredException}, which MSAL4J makes of an {@code invalid_grant} answer of
+     * the token endpoint, or a {@link MsalServiceException} whose {@code error} is {@code invalid_grant} or
+     * {@code interaction_required}. A revoked refresh token, a disabled account, a reset password and a blocked
+     * sign-in all answer {@code invalid_grant}. Deliberately not matched: a {@code cache_miss}
+     * {@code MsalClientException}, which only says this node holds no tokens for the account, and every other
+     * failure -- a timeout, an unreachable endpoint, a 5xx or a throttled request -- which says nothing about the
+     * account. Unlike {@link #findRejectedGrant(Throwable)}, which judges the authorization code a caller sent, this
+     * judges the refresh token MSAL4J holds for the user.
+     *
+     * @param e The failure of the silent acquisition.
+     * @return The service exception that refuses the renewal, or null when the failure is anything else.
+     */
+    protected static MsalServiceException findRefusedRenewal(final Throwable e) {
+        for (Throwable t = e; t != null; t = t.getCause()) {
+            if (t instanceof final MsalServiceException m && (m instanceof MsalInteractionRequiredException
+                    || "invalid_grant".equals(m.errorCode()) || "interaction_required".equals(m.errorCode()))) {
+                return m;
+            }
+        }
+        return null;
+    }
+
+    /**
      * Attempts to refresh tokens silently using the MSAL4J silent authentication flow.
      * @param user The Entra ID user whose tokens need to be refreshed.
-     * @return The new authentication result, or null if silent refresh failed.
+     * @return The new authentication result, or null if the silent acquisition produced nothing for a reason that
+     *         says nothing about the account: this node's token cache holds no tokens for it, or the token endpoint
+     *         could not be asked.
+     * @throws MsalServiceException When Entra ID refused the renewal, see {@link #findRefusedRenewal(Throwable)}.
      */
     public IAuthenticationResult refreshTokenSilently(final EntraIdCredential.EntraIdUser user) {
         try {
@@ -1021,6 +1051,12 @@ public class EntraIdAuthenticator implements SsoAuthenticator {
             trackAccount(result);
             return result;
         } catch (final Exception e) {
+            final MsalServiceException refusal = findRefusedRenewal(e);
+            if (refusal != null) {
+                // Not swallowed like the rest: the account has to sign in again, and the caller
+                // ends the login session on it rather than carrying on with the groups it had.
+                throw refusal;
+            }
             if (logger.isDebugEnabled()) {
                 logger.debug("Silent token acquisition failed: {}", e.getMessage());
             }
