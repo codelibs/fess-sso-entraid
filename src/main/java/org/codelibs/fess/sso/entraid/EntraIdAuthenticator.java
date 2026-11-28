@@ -247,9 +247,12 @@ public class EntraIdAuthenticator implements SsoAuthenticator {
     /**
      * Response parameters whose values are credentials. Their values are truncated before being
      * written to a debug log; every other parameter is logged verbatim so that a failed login can
-     * still be diagnosed from {@code state}, {@code error} and {@code error_description}.
+     * still be diagnosed from {@code error} and {@code error_description}. The {@code state} is
+     * treated as a credential too: until the callback is answered it is what ties the login to the
+     * session, and the truncated value is still enough to match a callback to its authorization
+     * request.
      */
-    protected static final Set<String> SENSITIVE_PARAMS = Set.of(CODE, ID_TOKEN, "access_token", "refresh_token", "client_secret");
+    protected static final Set<String> SENSITIVE_PARAMS = Set.of(CODE, ID_TOKEN, STATE, "access_token", "refresh_token", "client_secret");
 
     /** Number of leading characters kept when a secret is written to a debug log. */
     protected static final int MASK_PREFIX_LENGTH = 8;
@@ -534,11 +537,13 @@ public class EntraIdAuthenticator implements SsoAuthenticator {
         storeStateInSession(request.getSession(), state, nonce);
 
         final String responseMode = getResponseMode();
-        final String authUrl = getAuthorityUrl() + "oauth2/v2.0/authorize?response_type=code&scope=" + V2_SCOPES_ENCODED + "&response_mode="
+        final String baseUrl = getAuthorityUrl() + "oauth2/v2.0/authorize?response_type=code&scope=" + V2_SCOPES_ENCODED + "&response_mode="
                 + responseMode + "&redirect_uri=" + URLEncoder.encode(getReplyUrl(request), Constants.UTF_8_CHARSET) + "&client_id="
-                + getClientId() + "&state=" + state + "&nonce=" + nonce;
+                + getClientId();
+        final String authUrl = baseUrl + "&state=" + state + "&nonce=" + nonce;
         if (logger.isDebugEnabled()) {
-            logger.debug("redirect to: {}", authUrl);
+            // The state and the nonce are truncated like the credentials of the callback.
+            logger.debug("redirect to: {}&state={}&nonce={}", baseUrl, maskSecret(state), maskSecret(nonce));
         }
         return authUrl;
 
@@ -602,7 +607,7 @@ public class EntraIdAuthenticator implements SsoAuthenticator {
                 .collect(Collectors.toList())
                 .forEach(s -> {
                     if (logger.isDebugEnabled()) {
-                        logger.debug("Removing old state: {}", s);
+                        logger.debug("Removing old state: {}", maskSecret(s));
                     }
                     stateMap.remove(s);
                 });
@@ -628,7 +633,7 @@ public class EntraIdAuthenticator implements SsoAuthenticator {
                 .collect(Collectors.toList())
                 .forEach(s -> {
                     if (logger.isDebugEnabled()) {
-                        logger.debug("Removing surplus state: {}", s);
+                        logger.debug("Removing surplus state: {}", maskSecret(s));
                     }
                     stateMap.remove(s);
                 });
@@ -787,7 +792,7 @@ public class EntraIdAuthenticator implements SsoAuthenticator {
 
             final String nonce = (String) claimsSet.getClaim("nonce");
             if (logger.isDebugEnabled()) {
-                logger.debug("nonce={}", nonce);
+                logger.debug("nonce={}", maskSecret(nonce));
             }
             if (StringUtil.isEmpty(nonce) || !nonce.equals(stateData.getNonce())) {
                 throw new SsoStateException("could not validate nonce");
@@ -2074,7 +2079,7 @@ public class EntraIdAuthenticator implements SsoAuthenticator {
 
         @Override
         public String toString() {
-            return "StateData [nonce=" + nonce + ", expiration=" + expiration + "]";
+            return "StateData [nonce=" + maskSecret(nonce) + ", expiration=" + expiration + "]";
         }
     }
 
