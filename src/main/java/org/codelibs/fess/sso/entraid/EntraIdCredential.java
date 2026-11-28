@@ -160,6 +160,17 @@ public class EntraIdCredential implements LoginCredential, FessCredential {
         protected volatile String objectId;
 
         /**
+         * Whether Microsoft Graph has answered that this account is a member of the tenant
+         * ({@code userType} {@code Member}) rather than a guest, or null while it has not answered
+         * yet. Only a member gets the local part of its name as a permission: that is the name its
+         * on-premises directory account carries, whereas a guest's name is the address it was
+         * invited with, which is not a name of this directory. A session whose first lookup is
+         * still pending or has failed does not get it either; a later lookup that fails keeps the
+         * last answer. Volatile for the same reason as {@link #permissionState}.
+         */
+        protected volatile Boolean member;
+
+        /**
          * Constructs an Entra ID user with the authentication result.
          * @param authResult The authentication result from Entra ID.
          */
@@ -226,7 +237,8 @@ public class EntraIdCredential implements LoginCredential, FessCredential {
                     permissionSet.add(systemHelper.getSearchRoleByDirectoryUser(objectId));
                 }
                 permissionSet.add(systemHelper.getSearchRoleByDirectoryUser(username));
-                if (ComponentUtil.getFessConfig().isEntraIdUseDomainServices() && username.indexOf('@') >= 0) {
+                if (Boolean.TRUE.equals(member) && ComponentUtil.getFessConfig().isEntraIdUseDomainServices()
+                        && username.indexOf('@') >= 0) {
                     final String[] values = username.split("@");
                     if (values.length > 1) {
                         permissionSet.add(systemHelper.getSearchRoleByDirectoryUser(values[0]));
@@ -421,6 +433,31 @@ public class EntraIdCredential implements LoginCredential, FessCredential {
          */
         public synchronized void setRoles(final String[] roles) {
             this.roles = roles;
+        }
+
+        /**
+         * Whether this account is known to be a member of the tenant rather than a guest.
+         * @return True once Microsoft Graph has answered {@code Member}.
+         */
+        public boolean isMember() {
+            return Boolean.TRUE.equals(member);
+        }
+
+        /**
+         * Whether Microsoft Graph has answered whether this account is a member or a guest.
+         * @return True once it has, whatever the answer was.
+         */
+        public boolean isUserTypeKnown() {
+            return member != null;
+        }
+
+        /**
+         * Records whether this account is a member of the tenant rather than a guest. The caller
+         * resets the permissions afterwards, as it does after {@link #setGroups(String[])}.
+         * @param member True when Microsoft Graph answered {@code Member}.
+         */
+        public synchronized void setMember(final boolean member) {
+            this.member = member;
         }
 
         @Override

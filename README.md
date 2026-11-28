@@ -51,7 +51,7 @@ Then configure the application registered in Entra ID:
 | `entraid.default.groups` | groups applied to every Entra ID user, comma-separated |
 | `entraid.default.roles` | roles applied to every Entra ID user, comma-separated |
 | `entraid.permission.fields` | group and role fields to add as permission values on top of the object ID, comma-separated (default `mail`) |
-| `entraid.use.ds` | when `true` (the default), also add the local part of a `name@domain` permission value |
+| `entraid.use.ds` | when `true` (the default), also add the local part of a `name@domain` permission value; for the user's own name, only when the account is a member of the tenant, not a guest |
 
 Each key has a legacy `aad.*` spelling — `aad.tenant`, `aad.client.id` and so on — that is read
 when the `entraid.*` one holds no value.

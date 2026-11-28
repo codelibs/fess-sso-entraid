@@ -23,6 +23,7 @@ import java.util.Collections;
 import java.util.Date;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Random;
 import java.util.Set;
@@ -251,6 +252,79 @@ public class EntraIdSessionSerializersTest extends UnitFessTestCase {
     }
 
     @Test
+    public void test_user_restoredMemberKeepsTheLocalPartOfItsName() {
+        registerHelpers();
+        final Probe serializer = newSerializer();
+        final EntraIdUser original = newResolvedUser(PermissionState.RESOLVED);
+        original.setMember(true);
+
+        final byte[] bytes = serializer.toBytes(attributes(ATTRIBUTE, new FessUserBean(original)));
+        final EntraIdUser restored = (EntraIdUser) ((FessUserBean) serializer.fromBytes(bytes).get(ATTRIBUTE)).getFessUser();
+
+        assertTrue(restored.isMember());
+        ComponentUtil.register(new SystemHelper(), "systemHelper");
+        assertTrue(Arrays.asList(restored.getPermissions()).contains("1taro"));
+    }
+
+    @Test
+    public void test_user_restoredGuestDoesNotGetTheLocalPartOfItsName() {
+        // A guest, or an account whose user type was never answered: the node that restores it
+        // cannot ask Microsoft Graph, so what it is handed is all it goes by.
+        registerHelpers();
+        final Probe serializer = newSerializer();
+        final EntraIdUser original = newResolvedUser(PermissionState.RESOLVED);
+        original.setMember(false);
+
+        final byte[] bytes = serializer.toBytes(attributes(ATTRIBUTE, new FessUserBean(original)));
+        final EntraIdUser restored = (EntraIdUser) ((FessUserBean) serializer.fromBytes(bytes).get(ATTRIBUTE)).getFessUser();
+
+        assertFalse(restored.isMember());
+        assertTrue(restored.isUserTypeKnown());
+        ComponentUtil.register(new SystemHelper(), "systemHelper");
+        final List<String> permissions = Arrays.asList(restored.getPermissions());
+        assertFalse(permissions.toString(), permissions.contains("1taro"));
+        assertTrue(permissions.toString(), permissions.contains("1" + USER_NAME));
+    }
+
+    @Test
+    public void test_user_restoredUserWhoseTypeWasNeverAnsweredStaysUnknown() {
+        // A FAILED user whose first user type lookup failed is shared too. It must arrive as
+        // unknown, not as an answered guest, so that a later failed lookup on the node holding
+        // its token cache still reports it rather than keeping a "last answer" it never had.
+        registerHelpers();
+        final Probe serializer = newSerializer();
+        final EntraIdUser original = newResolvedUser(PermissionState.FAILED);
+        assertFalse(original.isUserTypeKnown());
+
+        final byte[] bytes = serializer.toBytes(attributes(ATTRIBUTE, new FessUserBean(original)));
+        final EntraIdUser restored = (EntraIdUser) ((FessUserBean) serializer.fromBytes(bytes).get(ATTRIBUTE)).getFessUser();
+
+        assertFalse(restored.isUserTypeKnown());
+        assertFalse(restored.isMember());
+        assertEquals(PermissionState.FAILED, restored.getPermissionState());
+    }
+
+    @Test
+    public void test_user_layoutWithoutTheMemberFlagIsRefused() {
+        // Layout 1 carried no member flag. Reading it as layout 2 would misread the end of the
+        // bytes, so it is refused, and the session store drops the user: they log in again.
+        registerHelpers();
+        final Output output = new Output(256, -1);
+        output.writeVarInt(1, true);
+        EntraIdSessionSerializers.writeString(output, USER_NAME);
+        EntraIdSessionSerializers.writeString(output, HOME_ACCOUNT_ID);
+        EntraIdSessionSerializers.writeString(output, ENVIRONMENT);
+        output.writeLong(clock.get());
+        EntraIdSessionSerializers.writeString(output, OBJECT_ID);
+        output.writeByte(0);
+        output.writeBoolean(true);
+        EntraIdSessionSerializers.writeStrings(output, new String[] { "g" });
+        EntraIdSessionSerializers.writeStrings(output, new String[] { "r" });
+
+        assertRefused(output.toBytes());
+    }
+
+    @Test
     public void test_user_restoredUserDoesNotStartAResolution() {
         registerHelpers();
         final Probe serializer = newSerializer();
@@ -390,6 +464,7 @@ public class EntraIdSessionSerializersTest extends UnitFessTestCase {
         output.writeBoolean(true);
         EntraIdSessionSerializers.writeStrings(output, new String[] { "g" });
         EntraIdSessionSerializers.writeStrings(output, new String[] { "r" });
+        output.writeByte(2);
         return output;
     }
 
@@ -462,7 +537,7 @@ public class EntraIdSessionSerializersTest extends UnitFessTestCase {
         final byte[] valid = validUserOutput().toBytes();
 
         final byte[] otherFormat = valid.clone();
-        otherFormat[0] = 2;
+        otherFormat[0] = (byte) (EntraIdSessionSerializers.USER_FORMAT + 1);
         assertRefused(otherFormat);
 
         final Output pending = new Output(256, -1);
@@ -482,6 +557,10 @@ public class EntraIdSessionSerializersTest extends UnitFessTestCase {
         noName.writeVarInt(EntraIdSessionSerializers.USER_FORMAT, true);
         EntraIdSessionSerializers.writeString(noName, "");
         assertRefused(noName.toBytes());
+
+        final byte[] invalidUserType = valid.clone();
+        invalidUserType[invalidUserType.length - 1] = 3;
+        assertRefused(invalidUserType);
 
         final Output negativeExpiry = new Output(256, -1);
         negativeExpiry.writeVarInt(EntraIdSessionSerializers.USER_FORMAT, true);

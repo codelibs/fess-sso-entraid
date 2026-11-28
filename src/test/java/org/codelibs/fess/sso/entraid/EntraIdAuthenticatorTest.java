@@ -971,10 +971,24 @@ public class EntraIdAuthenticatorTest extends UnitFessTestCase {
     }
 
     /**
+     * An authenticator whose user type lookup never reaches Microsoft Graph. The tests that drive
+     * {@code updateMemberOf} replace the membership lookup themselves; without this the user type
+     * lookup beside it would go to graph.microsoft.com with a made-up token. It answers "not a
+     * member", which is an answer: the state those tests assert is decided by the memberships
+     * alone.
+     */
+    private static class GraphlessAuthenticator extends EntraIdAuthenticator {
+        @Override
+        protected Boolean processUserType(final EntraIdUser user, final String url) {
+            return Boolean.FALSE;
+        }
+    }
+
+    /**
      * An authenticator whose Graph access is replaced by a scripted one, so the caching and
      * recursion around it can be exercised without a tenant.
      */
-    private static class ScriptedAuthenticator extends EntraIdAuthenticator {
+    private static class ScriptedAuthenticator extends GraphlessAuthenticator {
         private final Map<String, String[]> parents = new HashMap<>();
         private final List<String> lookups = new ArrayList<>();
         private final Set<String> failing = new HashSet<>();
@@ -1638,7 +1652,7 @@ public class EntraIdAuthenticatorTest extends UnitFessTestCase {
         // long after login. A throttled or newly unauthorised Graph used to leave the user with
         // the configured defaults alone, silently taking away every permission they logged in
         // with, until some later call happened to succeed.
-        final EntraIdAuthenticator authenticator = new EntraIdAuthenticator() {
+        final EntraIdAuthenticator authenticator = new GraphlessAuthenticator() {
             @Override
             protected boolean processDirectMemberOf(final EntraIdUser user, final List<String> groupList, final List<String> roleList,
                     final List<String> groupIdsForParentLookup, final String url) {
@@ -1695,7 +1709,7 @@ public class EntraIdAuthenticatorTest extends UnitFessTestCase {
         // processDirectMemberOf pages through /me/memberOf and adds as it goes, so a failure on a
         // later page leaves the earlier ones in the list. The result is always a superset of the
         // configured defaults, which are seeded before the lookup runs.
-        final EntraIdAuthenticator authenticator = new EntraIdAuthenticator() {
+        final EntraIdAuthenticator authenticator = new GraphlessAuthenticator() {
             @Override
             protected boolean processDirectMemberOf(final EntraIdUser user, final List<String> groupList, final List<String> roleList,
                     final List<String> groupIdsForParentLookup, final String url) {
@@ -1718,7 +1732,7 @@ public class EntraIdAuthenticatorTest extends UnitFessTestCase {
 
     /** An authenticator whose direct membership lookup always reports a failure. */
     private EntraIdAuthenticator newAuthenticatorWhoseLookupFails() {
-        return new EntraIdAuthenticator() {
+        return new GraphlessAuthenticator() {
             @Override
             protected boolean processDirectMemberOf(final EntraIdUser user, final List<String> groupList, final List<String> roleList,
                     final List<String> groupIdsForParentLookup, final String url) {
@@ -1731,7 +1745,7 @@ public class EntraIdAuthenticatorTest extends UnitFessTestCase {
     public void test_updateMemberOf_appliesTheDefaultsWhenTheLookupFindsNoMemberships() {
         // A user who genuinely belongs to nothing is a successful answer, not a failure, and the
         // configured defaults are exactly what they are meant to get.
-        final EntraIdAuthenticator authenticator = new EntraIdAuthenticator() {
+        final EntraIdAuthenticator authenticator = new GraphlessAuthenticator() {
             @Override
             protected boolean processDirectMemberOf(final EntraIdUser user, final List<String> groupList, final List<String> roleList,
                     final List<String> groupIdsForParentLookup, final String url) {
@@ -1913,6 +1927,191 @@ public class EntraIdAuthenticatorTest extends UnitFessTestCase {
     }
 
     @Test
+    public void test_processUserType_answersTrueForAMemberOnly() throws Exception {
+        // userType is "Member" or "Guest", and null on some older accounts. Only an explicit
+        // Member is one: anything else must not grant the local part of the name.
+        final EntraIdAuthenticator authenticator = newAuthenticatorWithControlledClock();
+        final EntraIdUser user = newUserWithoutGraph();
+
+        try (GraphStub graph = new GraphStub(200, Map.of(), "{\"userType\":\"Member\"}")) {
+            assertEquals(Boolean.TRUE, authenticator.processUserType(user, graph.url()));
+        }
+        for (final String body : new String[] { "{\"userType\":\"Guest\"}", "{\"userType\":null}", "{}", "{\"userType\":\"member\"}" }) {
+            try (GraphStub graph = new GraphStub(200, Map.of(), body)) {
+                assertEquals(body, Boolean.FALSE, authenticator.processUserType(user, graph.url()));
+            }
+        }
+    }
+
+    @Test
+    public void test_processUserType_reportsAnErrorAsUnknown() throws Exception {
+        // An error is no answer, so it must not be mistaken for "not a member" -- that would take
+        // the local part away from a member on every throttled token renewal -- nor for a member.
+        final EntraIdAuthenticator authenticator = newAuthenticatorWithControlledClock();
+        final EntraIdUser user = newUserWithoutGraph();
+        final LogCapturingAppender logs = LogCapturingAppender.attach(EntraIdAuthenticator.class);
+        try (GraphStub graph = new GraphStub(403, Map.of(), "{\"error\":{\"code\":\"Authorization_RequestDenied\"}}")) {
+            assertNull(authenticator.processUserType(user, graph.url()));
+            assertEquals(1, logs.warnings().size(), logs.warnings().toString());
+            assertTrue(logs.warnings().toString(), logs.warnings().get(0).contains("user type of " + user.getName()));
+        } finally {
+            logs.detach();
+        }
+    }
+
+    @Test
+    public void test_processUserType_reportsATransportFailureAsUnknown() {
+        final EntraIdAuthenticator authenticator = new EntraIdAuthenticator();
+        authenticator.setGraphConnectTimeout(500);
+        authenticator.setGraphReadTimeout(500);
+        final EntraIdUser user = newUserWithoutGraph();
+        final int deadPort;
+        try (ServerSocket socket = new ServerSocket(0, 1, InetAddress.getLoopbackAddress())) {
+            deadPort = socket.getLocalPort();
+        } catch (final IOException e) {
+            throw new IllegalStateException(e);
+        }
+
+        assertNull(authenticator.processUserType(user, "http://127.0.0.1:" + deadPort + "/v1.0/me"));
+    }
+
+    @Test
+    public void test_processUserType_recordsTheBackoffAThrottledGraphAskedFor() throws Exception {
+        final EntraIdAuthenticator authenticator = newAuthenticatorWithControlledClock();
+        final EntraIdUser user = newUserWithoutGraph();
+
+        try (GraphStub graph = new GraphStub(429, Map.of("Retry-After", "120"), "{\"error\":{\"code\":\"TooManyRequests\"}}")) {
+            assertNull(authenticator.processUserType(user, graph.url()));
+        }
+
+        assertEquals(clock.get() + 120_000L, authenticator.graphThrottledUntil);
+    }
+
+    /**
+     * An authenticator whose membership lookup answers {@code membersResolved} with no groups and
+     * whose user type lookup answers {@code userType}, so that a test can drive both outcomes of
+     * {@code updateMemberOf} without Microsoft Graph.
+     */
+    private EntraIdAuthenticator newAuthenticatorWithUserType(final AtomicReference<Boolean> userType,
+            final AtomicBoolean membersResolved) {
+        return new EntraIdAuthenticator() {
+            @Override
+            protected boolean processDirectMemberOf(final EntraIdUser user, final List<String> groupList, final List<String> roleList,
+                    final List<String> groupIdsForParentLookup, final String url) {
+                return membersResolved.get();
+            }
+
+            @Override
+            protected Boolean processUserType(final EntraIdUser user, final String url) {
+                assertTrue(url, url.endsWith("/me?$select=userType"));
+                return userType.get();
+            }
+        };
+    }
+
+    @Test
+    public void test_updateMemberOf_recordsWhetherTheAccountIsAMember() {
+        final AtomicReference<Boolean> userType = new AtomicReference<>(Boolean.TRUE);
+        final EntraIdAuthenticator authenticator = newAuthenticatorWithUserType(userType, new AtomicBoolean(true));
+        final EntraIdUser user = newUserWithoutGraph();
+        assertFalse(user.isMember());
+
+        authenticator.updateMemberOf(user);
+        assertTrue(user.isMember());
+
+        userType.set(Boolean.FALSE);
+        authenticator.updateMemberOf(user);
+        assertFalse(user.isMember());
+    }
+
+    @Test
+    public void test_updateMemberOf_leavesAnUnknownUserTypeAsNotAMemberAndReportsIt() {
+        // The first lookup failing must not grant anything: until Graph has said Member, the
+        // account is treated as a guest. A member then holds fewer permissions than it should,
+        // which is what FAILED is there to say, even though every membership resolved.
+        final EntraIdAuthenticator authenticator = newAuthenticatorWithUserType(new AtomicReference<>(null), new AtomicBoolean(true));
+        final EntraIdUser user = newUserWithoutGraph();
+
+        authenticator.updateMemberOf(user);
+
+        assertFalse(user.isMember());
+        assertFalse(user.isUserTypeKnown());
+        assertEquals(FessUser.PermissionState.FAILED, user.getPermissionState());
+    }
+
+    @Test
+    public void test_updateMemberOf_reportsAGuestAnswerAsResolved() {
+        // "Guest" is an answer: nothing is missing from the permissions of a guest.
+        final EntraIdAuthenticator authenticator =
+                newAuthenticatorWithUserType(new AtomicReference<>(Boolean.FALSE), new AtomicBoolean(true));
+        final EntraIdUser user = newUserWithoutGraph();
+
+        authenticator.updateMemberOf(user);
+
+        assertFalse(user.isMember());
+        assertTrue(user.isUserTypeKnown());
+        assertEquals(FessUser.PermissionState.RESOLVED, user.getPermissionState());
+    }
+
+    @Test
+    public void test_updateMemberOf_reportsTheFirstAnswerOnceALaterLookupGivesIt() {
+        // A first lookup that failed leaves the user FAILED; the next resolution that gets an
+        // answer -- on token renewal -- resolves it.
+        final AtomicReference<Boolean> userType = new AtomicReference<>(null);
+        final EntraIdAuthenticator authenticator = newAuthenticatorWithUserType(userType, new AtomicBoolean(true));
+        final EntraIdUser user = newUserWithoutGraph();
+        authenticator.updateMemberOf(user);
+        assertEquals(FessUser.PermissionState.FAILED, user.getPermissionState());
+
+        userType.set(Boolean.TRUE);
+        authenticator.updateMemberOf(user);
+
+        assertTrue(user.isMember());
+        assertEquals(FessUser.PermissionState.RESOLVED, user.getPermissionState());
+    }
+
+    @Test
+    public void test_updateMemberOf_keepsTheLastAnswerWhenTheUserTypeLookupFails() {
+        // The same rule as for the memberships: a token renewal that meets a throttled Graph keeps
+        // what was resolved before instead of taking it away until a later call succeeds.
+        final AtomicReference<Boolean> userType = new AtomicReference<>(Boolean.TRUE);
+        final EntraIdAuthenticator authenticator = newAuthenticatorWithUserType(userType, new AtomicBoolean(true));
+        final EntraIdUser user = newUserWithoutGraph();
+        authenticator.updateMemberOf(user);
+
+        assertEquals(FessUser.PermissionState.RESOLVED, user.getPermissionState());
+
+        userType.set(null);
+        authenticator.updateMemberOf(user);
+
+        assertTrue(user.isMember());
+        // The last answer stands, so nothing is missing and the state is not changed.
+        assertEquals(FessUser.PermissionState.RESOLVED, user.getPermissionState());
+    }
+
+    @Test
+    public void test_updateMemberOf_recordsAGuestEvenWhenTheMembershipLookupFails() {
+        // A re-resolution whose /me/memberOf fails returns before writing the memberships, and so
+        // before the permission reset that follows them. An answer that the account is no longer
+        // a member is written all the same, and the permissions computed before it are dropped.
+        ComponentUtil.register(new SystemHelper(), "systemHelper");
+        final AtomicReference<Boolean> userType = new AtomicReference<>(Boolean.TRUE);
+        final AtomicBoolean membersResolved = new AtomicBoolean(true);
+        final EntraIdAuthenticator authenticator = newAuthenticatorWithUserType(userType, membersResolved);
+        final EntraIdUser user = newUserWithoutGraph();
+        authenticator.updateMemberOf(user);
+        assertTrue(user.isMember());
+        assertTrue(List.of(user.getPermissions()).contains("1taro"));
+
+        userType.set(Boolean.FALSE);
+        membersResolved.set(false);
+        authenticator.updateMemberOf(user);
+
+        assertFalse(user.isMember());
+        assertFalse(List.of(user.getPermissions()).contains("1taro"));
+    }
+
+    @Test
     public void test_getMemberGroupIds_returnsTheParentIdsGraphAnswered() throws Exception {
         // toMemberGroupIds is covered directly, but the request around it -- the POST, the
         // securityEnabledOnly body and the applyGraphThrottle call ahead of the parser -- was
@@ -2029,7 +2228,7 @@ public class EntraIdAuthenticatorTest extends UnitFessTestCase {
 
     @Test
     public void test_updateMemberOf_replacesTheGroupsWhenGraphAnswers() {
-        final EntraIdAuthenticator authenticator = new EntraIdAuthenticator() {
+        final EntraIdAuthenticator authenticator = new GraphlessAuthenticator() {
             @Override
             protected boolean processDirectMemberOf(final EntraIdUser user, final List<String> groupList, final List<String> roleList,
                     final List<String> groupIdsForParentLookup, final String url) {
@@ -2421,7 +2620,7 @@ public class EntraIdAuthenticatorTest extends UnitFessTestCase {
 
     @Test
     public void test_updateMemberOf_marksTheFirstResolutionResolved() {
-        final EntraIdAuthenticator authenticator = new EntraIdAuthenticator() {
+        final EntraIdAuthenticator authenticator = new GraphlessAuthenticator() {
             @Override
             protected boolean processDirectMemberOf(final EntraIdUser user, final List<String> groupList, final List<String> roleList,
                     final List<String> groupIdsForParentLookup, final String url) {
@@ -2441,7 +2640,7 @@ public class EntraIdAuthenticatorTest extends UnitFessTestCase {
     public void test_updateMemberOf_marksAFailedFirstResolutionFailed() {
         // The login still completes -- the user keeps their user-level permission and the
         // configured defaults -- but the shortfall has to be visible rather than silent.
-        final EntraIdAuthenticator authenticator = new EntraIdAuthenticator() {
+        final EntraIdAuthenticator authenticator = new GraphlessAuthenticator() {
             @Override
             protected boolean processDirectMemberOf(final EntraIdUser user, final List<String> groupList, final List<String> roleList,
                     final List<String> groupIdsForParentLookup, final String url) {
@@ -2460,7 +2659,7 @@ public class EntraIdAuthenticatorTest extends UnitFessTestCase {
     public void test_updateMemberOf_leavesTheStateAloneOnAReResolution() {
         // A token renewal re-resolves a user who already holds working permissions. Neither
         // PENDING nor FAILED is true of them, so neither may be written.
-        final EntraIdAuthenticator authenticator = new EntraIdAuthenticator() {
+        final EntraIdAuthenticator authenticator = new GraphlessAuthenticator() {
             @Override
             protected boolean processDirectMemberOf(final EntraIdUser user, final List<String> groupList, final List<String> roleList,
                     final List<String> groupIdsForParentLookup, final String url) {
@@ -2483,7 +2682,7 @@ public class EntraIdAuthenticatorTest extends UnitFessTestCase {
         // The user's first lookup failed, so they are FAILED and hold the defaults. A token
         // renewal an hour later re-resolves them successfully -- they now genuinely hold their
         // groups, and going on telling them their permissions could not be loaded would be a lie.
-        final EntraIdAuthenticator authenticator = new EntraIdAuthenticator() {
+        final EntraIdAuthenticator authenticator = new GraphlessAuthenticator() {
             @Override
             protected boolean processDirectMemberOf(final EntraIdUser user, final List<String> groupList, final List<String> roleList,
                     final List<String> groupIdsForParentLookup, final String url) {
@@ -2581,7 +2780,7 @@ public class EntraIdAuthenticatorTest extends UnitFessTestCase {
     public void test_updateMemberOf_writesTheResolvedGroupsOnTopOfTheSeededDefaults() {
         // First resolution, Graph answers: the seed is a floor, not a ceiling -- the resolved
         // groups join it rather than replacing it or being dropped in favour of it.
-        final EntraIdAuthenticator authenticator = new EntraIdAuthenticator() {
+        final EntraIdAuthenticator authenticator = new GraphlessAuthenticator() {
             @Override
             protected boolean processDirectMemberOf(final EntraIdUser user, final List<String> groupList, final List<String> roleList,
                     final List<String> groupIdsForParentLookup, final String url) {
@@ -2612,7 +2811,7 @@ public class EntraIdAuthenticatorTest extends UnitFessTestCase {
         // Nothing about the user may change -- these are the groups they are actually searching
         // with, and replacing them with the defaults alone would silently take their results away.
         final AtomicBoolean graphAnswers = new AtomicBoolean(true);
-        final EntraIdAuthenticator authenticator = new EntraIdAuthenticator() {
+        final EntraIdAuthenticator authenticator = new GraphlessAuthenticator() {
             @Override
             protected boolean processDirectMemberOf(final EntraIdUser user, final List<String> groupList, final List<String> roleList,
                     final List<String> groupIdsForParentLookup, final String url) {
@@ -2673,7 +2872,7 @@ public class EntraIdAuthenticatorTest extends UnitFessTestCase {
     public void test_updateMemberOf_walksParentGroupsWithoutASecondScheduledTask() {
         // The walk used to be a second TimeoutManager task, which published direct-only groups
         // first and then overwrote them. One task writes once.
-        final EntraIdAuthenticator authenticator = new EntraIdAuthenticator() {
+        final EntraIdAuthenticator authenticator = new GraphlessAuthenticator() {
             @Override
             protected boolean processDirectMemberOf(final EntraIdUser user, final List<String> groupList, final List<String> roleList,
                     final List<String> groupIdsForParentLookup, final String url) {
@@ -2807,7 +3006,7 @@ public class EntraIdAuthenticatorTest extends UnitFessTestCase {
         // ComponentUtil.getActivityHelper() from returning null, so deleting the call from
         // updateMemberOf left the whole suite green.
         final AtomicBoolean graphAnswers = new AtomicBoolean(true);
-        final EntraIdAuthenticator authenticator = new EntraIdAuthenticator() {
+        final EntraIdAuthenticator authenticator = new GraphlessAuthenticator() {
             @Override
             protected boolean processDirectMemberOf(final EntraIdUser user, final List<String> groupList, final List<String> roleList,
                     final List<String> groupIdsForParentLookup, final String url) {
@@ -2967,7 +3166,7 @@ public class EntraIdAuthenticatorTest extends UnitFessTestCase {
      */
     private EntraIdAuthenticator newAuthenticatorWithScriptedWalk(final List<String> groupIds, final List<String> walked,
             final java.util.function.Predicate<String> walkResult, final boolean throttled) {
-        return new EntraIdAuthenticator() {
+        return new GraphlessAuthenticator() {
             @Override
             protected boolean processDirectMemberOf(final EntraIdUser user, final List<String> groupList, final List<String> roleList,
                     final List<String> groupIdsForParentLookup, final String url) {
