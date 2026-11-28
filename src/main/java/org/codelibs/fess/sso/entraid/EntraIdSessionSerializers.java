@@ -64,8 +64,11 @@ public class EntraIdSessionSerializers {
     /** The name of the component of Fess that serializes the attributes of a session for the session store. */
     protected static final String SESSION_DATA_SERIALIZER = "sessionDataSerializer";
 
-    /** The layout of the bytes of a user. A reader of another layout refuses the user instead of misreading it. */
-    protected static final int USER_FORMAT = 1;
+    /**
+     * The layout of the bytes of a user. A reader of another layout refuses the user instead of misreading it. Layout 2
+     * added the user type (member, guest or not known yet), so a user stored in layout 1 is dropped and logs in again.
+     */
+    protected static final int USER_FORMAT = 2;
 
     /** The layout of the bytes of the state of an authorization attempt. */
     protected static final int STATE_FORMAT = 1;
@@ -211,10 +214,11 @@ public class EntraIdSessionSerializers {
      * Writes the part of an {@link EntraIdUser} that authorization and the continued operation of the
      * session read. Written: the account (user name, home account id and environment, which are the key of
      * the token cache of MSAL4J and no credential), when the access token expires, the object id, the groups
-     * and roles that were resolved, whether the resolution has completed, and how it ended. Not written: the
-     * access token, the ID token and the refresh token (which the user does not hold), the permissions (they
-     * are derived from the rest), the state of a token renewal in progress and the time until which a failed
-     * renewal is not retried (they belong to the node).
+     * and roles that were resolved, whether the resolution has completed, how it ended, and whether the account
+     * is a member rather than a guest, if Microsoft Graph has said. Not written: the access token, the ID token
+     * and the refresh token (which the user does not hold), the permissions (they are derived from the rest),
+     * the state of a token renewal in progress and the time until which a failed renewal is not retried (they
+     * belong to the node).
      *
      * <p>A user whose memberships are still being resolved is not written: it throws, and the session store
      * then keeps the whole user bean on this node and writes it with a later request, when the resolution
@@ -237,9 +241,11 @@ public class EntraIdSessionSerializers {
             if (state == PermissionState.RESOLVED || state == PermissionState.FAILED) {
                 final String[] groups;
                 final String[] roles;
+                final int userType;
                 synchronized (user) {
                     groups = user.getGroupNames();
                     roles = user.getRoleNames();
+                    userType = !user.isUserTypeKnown() ? 0 : user.isMember() ? 2 : 1;
                 }
                 final IAuthenticationResult result = user.getAuthenticationResult();
                 final IAccount account = result.account();
@@ -256,6 +262,7 @@ public class EntraIdSessionSerializers {
                 output.writeBoolean(user.isResolutionCompleted());
                 writeStrings(output, groups);
                 writeStrings(output, roles);
+                output.writeByte(userType);
             } else {
                 throw new IllegalStateException("The Entra ID memberships of the user are not resolved yet: " + state);
             }
@@ -286,12 +293,20 @@ public class EntraIdSessionSerializers {
             final boolean resolutionCompleted = input.readBoolean();
             final String[] groups = readStrings(input);
             final String[] roles = readStrings(input);
+            // 0: Microsoft Graph has not answered, 1: not a member, 2: a member
+            final byte userType = input.readByte();
+            if (userType < 0 || userType > 2) {
+                throw new IllegalStateException("The user type of the Entra ID user is invalid.");
+            }
 
             final EntraIdUser user = new EntraIdUser(
                     new RestoredAuthenticationResult(new RestoredAccount(username, homeAccountId, environment), new Date(expiresOn)),
                     objectId);
             user.setGroups(groups);
             user.setRoles(roles);
+            if (userType != 0) {
+                user.setMember(userType == 2);
+            }
             user.setPermissionState(state);
             if (resolutionCompleted) {
                 user.markResolutionCompleted();

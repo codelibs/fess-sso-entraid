@@ -1171,6 +1171,16 @@ public class EntraIdAuthenticator implements SsoAuthenticator {
                     groupList.size(), roleList.size(), groupIdsForParentLookup.size());
         }
 
+        // Whether the account is a member or a guest decides whether the local part of its name
+        // is a permission. Written whatever the membership lookup did, so a guest loses it even
+        // when /me/memberOf fails; a lookup that failed writes nothing, which keeps the last
+        // answer -- and before the first one, that is "not a member", reported as FAILED below.
+        final Boolean member = processUserType(user, GRAPH_V1_URL + "/me?$select=userType");
+        if (member != null) {
+            user.setMember(member);
+            user.resetPermissions();
+        }
+
         if (!resolved) {
             // Microsoft Graph did not answer with a membership list -- an expired token, a
             // throttled tenant, a revoked permission.
@@ -1236,7 +1246,11 @@ public class EntraIdAuthenticator implements SsoAuthenticator {
         // to MAX_GRAPH_THROTTLE_SECONDS while the direct lookup keeps answering. The users
         // resolved in that window hold their direct groups alone -- fewer permissions than they
         // should have, which is what FAILED is there to say.
-        user.setPermissionState(resolved && parentsResolved ? PermissionState.RESOLVED : PermissionState.FAILED);
+        //
+        // So does a user type Graph has never answered: a member is then held without the local
+        // part of its name. Once an answer is in, a later lookup that fails keeps it and is no
+        // shortfall.
+        user.setPermissionState(resolved && parentsResolved && user.isUserTypeKnown() ? PermissionState.RESOLVED : PermissionState.FAILED);
 
         // Every path that reaches here has written the memberships, so the next resolution is a
         // re-resolution and must keep them rather than fall back to the defaults alone.
@@ -1424,6 +1438,43 @@ public class EntraIdAuthenticator implements SsoAuthenticator {
             // chooses. Nothing thrown from inside this method has to propagate to the caller.
             logger.warn("Failed to access groups/roles in Entra ID.", e);
             return false;
+        }
+    }
+
+    /**
+     * Reads whether the signed-in account is a member of the tenant or a guest from the
+     * {@code userType} property of {@code /me}, which the {@code User.Read} permission that
+     * {@code /me/memberOf} needs already covers.
+     *
+     * @param user The Entra ID user.
+     * @param url The Microsoft Graph URL to read the user type from. A parameter so that this, like
+     *            {@link #processDirectMemberOf}, can be pointed at a stub rather than at Microsoft
+     *            Graph.
+     * @return True when Microsoft Graph answered {@code Member}, false for any other answer --
+     *         {@code Guest}, or none at all -- and null when it reported an error or could not be
+     *         read.
+     */
+    protected Boolean processUserType(final EntraIdUser user, final String url) {
+        if (logger.isDebugEnabled()) {
+            logger.debug("[processUserType] Fetching the user type from URL: {}", url);
+        }
+        try (CurlResponse response = createGraphRequest(Curl.get(url), user.getAuthenticationResult().accessToken()).execute()) {
+            // Before the body, for the same reason as in processDirectMemberOf: a throttled reply
+            // is not required to be JSON.
+            applyGraphThrottle(response);
+            final Map<String, Object> contentMap = response.getContent(SearchEngineCurl.jsonParser());
+            if (logger.isDebugEnabled()) {
+                logger.debug("[processUserType] response={}", contentMap);
+            }
+            if (contentMap.containsKey("error")) {
+                logger.warn("Failed to access the user type of {}: {}", user.getName(), contentMap);
+                return null;
+            }
+            return "Member".equals(contentMap.get("userType"));
+        } catch (final IOException | RuntimeException e) {
+            // See processDirectMemberOf: nothing thrown here may escape updateMemberOf.
+            logger.warn("Failed to access the user type of {} in Entra ID.", user.getName(), e);
+            return null;
         }
     }
 

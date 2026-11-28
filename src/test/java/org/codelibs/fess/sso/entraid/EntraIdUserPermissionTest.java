@@ -211,6 +211,76 @@ public class EntraIdUserPermissionTest extends UnitFessTestCase {
     }
 
     @Test
+    public void test_getPermissions_grantsTheLocalPartOfTheNameToAMember() {
+        // entraid.use.ds defaults to true: a member's name is its on-premises account name at the
+        // directory's domain, and documents crawled from there name the account without the domain.
+        ComponentUtil.register(new SystemHelper(), "systemHelper");
+        final EntraIdUser user = newUser();
+        user.setGroups(new String[0]);
+        user.setRoles(new String[0]);
+        user.setMember(true);
+
+        final List<String> permissions = Arrays.asList(user.getPermissions());
+
+        assertTrue(permissions.toString(), permissions.contains("1taro"));
+        assertTrue(permissions.toString(), permissions.contains("1taro@contoso.onmicrosoft.com"));
+        assertTrue(permissions.toString(), permissions.contains("1" + OBJECT_ID));
+    }
+
+    @Test
+    public void test_getPermissions_withholdsTheLocalPartOfTheNameFromAnAccountNotKnownToBeAMember() {
+        // A guest's name is the address it was invited with, which is not a name of this
+        // directory. The same goes for an account whose user type is still being looked up, or
+        // could not be: only a confirmed member gets it.
+        ComponentUtil.register(new SystemHelper(), "systemHelper");
+        final EntraIdUser user = newUser();
+        user.setGroups(new String[0]);
+        user.setRoles(new String[0]);
+        assertFalse(user.isMember());
+
+        final List<String> permissions = Arrays.asList(user.getPermissions());
+
+        assertFalse(permissions.toString(), permissions.contains("1taro"));
+        // The full name and the object id are not affected.
+        assertTrue(permissions.toString(), permissions.contains("1taro@contoso.onmicrosoft.com"));
+        assertTrue(permissions.toString(), permissions.contains("1" + OBJECT_ID));
+
+        user.setMember(false);
+        user.resetPermissions();
+        assertFalse(Arrays.asList(user.getPermissions()).contains("1taro"));
+    }
+
+    @Test
+    public void test_updateMemberOf_resetsThePermissionsOnceTheAccountIsKnownToBeAMember() {
+        // The permissions are very likely computed once while the lookup is pending, without the
+        // local part. Unless updateMemberOf resets them, that value stays for the whole session.
+        ComponentUtil.register(new SystemHelper(), "systemHelper");
+        ComponentUtil.register(new ActivityHelper() {
+            @Override
+            public void permissionChanged(final OptionalThing<FessUserBean> user) {
+                // no-op
+            }
+        }, "activityHelper");
+        final EntraIdUser user = newUser();
+        assertFalse(Arrays.asList(user.getPermissions()).contains("1taro"));
+
+        new EntraIdAuthenticator() {
+            @Override
+            protected boolean processDirectMemberOf(final EntraIdUser user, final List<String> groupList, final List<String> roleList,
+                    final List<String> groupIdsForParentLookup, final String url) {
+                return true;
+            }
+
+            @Override
+            protected Boolean processUserType(final EntraIdUser user, final String url) {
+                return Boolean.TRUE;
+            }
+        }.updateMemberOf(user);
+
+        assertTrue(Arrays.toString(user.getPermissions()), Arrays.asList(user.getPermissions()).contains("1taro"));
+    }
+
+    @Test
     public void test_getPermissions_doesNotPinAStaleValueWhenTheAsyncLookupLands() throws Exception {
         // The membership resolution scheduled at login runs on a TimeoutManager thread while the
         // user is already logged in and searching. getPermissions() is a check-then-act -- read
@@ -399,6 +469,12 @@ public class EntraIdUserPermissionTest extends UnitFessTestCase {
                     final List<String> groupIdsForParentLookup, final String url) {
                 groupList.add("resolved-group");
                 return true;
+            }
+
+            @Override
+            protected Boolean processUserType(final EntraIdUser user, final String url) {
+                // not what this test is about; answers "not a member"
+                return Boolean.FALSE;
             }
         };
         resolvingAuthenticator.updateMemberOf(user);
