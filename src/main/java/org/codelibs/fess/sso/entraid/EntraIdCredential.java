@@ -32,6 +32,7 @@ import org.lastaflute.web.login.credential.LoginCredential;
 
 import com.microsoft.aad.msal4j.IAccount;
 import com.microsoft.aad.msal4j.IAuthenticationResult;
+import com.microsoft.aad.msal4j.MsalServiceException;
 import com.nimbusds.jwt.JWTClaimsSet;
 import com.nimbusds.jwt.JWTParser;
 
@@ -87,15 +88,14 @@ public class EntraIdCredential implements LoginCredential, FessCredential {
 
         /**
          * How long a silent acquisition that failed is left alone before another one is attempted
-         * for this session. A refresh token that has been revoked, an account that has been
-         * disabled, and an account a {@code logout()} elsewhere evicted from the shared MSAL4J
-         * cache all fail for good, and {@link #refresh()} runs on every action request, so
-         * retrying one unconditionally would put back the per-request round trip
-         * {@link #REFRESH_MARGIN} was introduced to remove. A minute matches the backoff
-         * {@code EntraIdAuthenticator} applies to a throttled Microsoft Graph, holds a session
-         * whose renewal cannot succeed to one acquisition a minute rather than one per request,
-         * and is short enough that a failure early in {@link #REFRESH_MARGIN} still leaves four
-         * more attempts before the token actually expires.
+         * for this session. An account a {@code logout()} elsewhere evicted from the shared MSAL4J
+         * cache, and a session restored on a node that did not handle the login, fail for good, and
+         * {@link #refresh()} runs on every request, so retrying one unconditionally would put back
+         * the per-request round trip {@link #REFRESH_MARGIN} was introduced to remove. A minute
+         * matches the backoff {@code EntraIdAuthenticator} applies to a throttled Microsoft Graph,
+         * holds a session whose renewal cannot succeed to one acquisition a minute rather than one
+         * per request, and is short enough that a failure early in {@link #REFRESH_MARGIN} still
+         * leaves four more attempts before the token actually expires.
          */
         protected static final long RENEWAL_THROTTLE_INTERVAL = 60 * 1000L;
 
@@ -151,6 +151,14 @@ public class EntraIdCredential implements LoginCredential, FessCredential {
          * instance keep reading it, hence volatile.
          */
         protected volatile long renewalThrottledUntil;
+
+        /**
+         * Set once Entra ID refused to renew this user's tokens (see
+         * {@code EntraIdAuthenticator#findRefusedRenewal}), and never cleared: the account has to
+         * sign in again, so {@link #isExpired()} ends the login session. Written by whichever
+         * request thread ran the acquisition, read by all of them, hence volatile.
+         */
+        protected volatile boolean renewalRefused;
 
         /**
          * The user's object id, once it is known. Read out of the ID token on first use and then
@@ -282,10 +290,11 @@ public class EntraIdCredential implements LoginCredential, FessCredential {
             final long currentTime = ComponentUtil.getSystemHelper().getCurrentTimeAsLong(); // milliseconds since epoch
             final boolean expired = tokenExpiryTime < currentTime;
             if (!expired && tokenExpiryTime - currentTime > REFRESH_MARGIN) {
-                // FessBaseAction.godHandPrologue calls this on every action request; a silent
-                // acquisition is a network call, so it must not happen per request. Until the
-                // token is close to expiring there is nothing to acquire, and the groups this
-                // user was given at login are still the ones Entra ID issued them.
+                // FessBaseAction.godHandPrologue calls this on every action request, and
+                // isExpired() on every request; a silent acquisition is a network call, so it must
+                // not happen per request. Until the token is close to expiring there is nothing to
+                // acquire, and the groups this user was given at login are still the ones Entra ID
+                // issued them.
                 if (logger.isDebugEnabled()) {
                     logger.debug("Token is still valid for {}ms. Skipping silent authentication.", tokenExpiryTime - currentTime);
                 }
@@ -349,11 +358,12 @@ public class EntraIdCredential implements LoginCredential, FessCredential {
                     }
                     return true;
                 }
-                // refreshTokenSilently answers null instead of throwing, so a revoked refresh
-                // token, a disabled account, and an account evicted from the shared MSAL4J cache
-                // all arrive here rather than in the catch below. A result that is itself already
-                // expired is treated the same way: keeping it would leave nothing to renew from
-                // and no record that the renewal has to be held off.
+                // refreshTokenSilently answers null for everything but a refusal, so an account
+                // evicted from the shared MSAL4J cache, a session restored on a node that did not
+                // handle the login, and a token endpoint that could not be asked all arrive here
+                // rather than in the catch below. A result that is itself already expired is
+                // treated the same way: keeping it would leave nothing to renew from and no record
+                // that the renewal has to be held off.
                 applyRenewalThrottle(currentTime);
                 logger.warn("Silent authentication returned no usable access token for {}. expired={}. Next attempt in {} seconds.",
                         getName(), expired, RENEWAL_THROTTLE_INTERVAL / 1000L);
@@ -363,8 +373,19 @@ public class EntraIdCredential implements LoginCredential, FessCredential {
                 // logging happened to be on. The throttle applied first is what keeps a
                 // persistent failure to one line per interval instead of one per request.
                 applyRenewalThrottle(currentTime);
-                logger.warn("Failed to renew the access token of {}. expired={}. Next attempt in {} seconds.", getName(), expired,
-                        RENEWAL_THROTTLE_INTERVAL / 1000L, e);
+                final MsalServiceException refusal = EntraIdAuthenticator.findRefusedRenewal(e);
+                if (refusal != null) {
+                    // Set before the finally releases `refreshing`, so no request can see the
+                    // renewal over without also seeing its outcome. The groups this session holds
+                    // are the ones Entra ID issued at login, and it will not issue any more.
+                    renewalRefused = true;
+                    logger.warn("Entra ID refused to renew the access token of {}: {} - {}. The login session is ended.", getName(),
+                            EntraIdAuthenticator.sanitizeForLog(refusal.errorCode()),
+                            EntraIdAuthenticator.sanitizeForLog(refusal.getMessage()));
+                } else {
+                    logger.warn("Failed to renew the access token of {}. expired={}. Next attempt in {} seconds.", getName(), expired,
+                            RENEWAL_THROTTLE_INTERVAL / 1000L, e);
+                }
             } finally {
                 refreshing.set(false);
             }
@@ -372,6 +393,44 @@ public class EntraIdCredential implements LoginCredential, FessCredential {
             // authorises this request and MSAL4J is asked again once the throttle lapses, but an
             // expired one leaves nothing to carry on with.
             return !expired;
+        }
+
+        /**
+         * Tells whether Entra ID refused to renew this user's tokens, which means the account has to
+         * sign in again -- its refresh token was revoked, it was disabled, its password was reset or
+         * its sign-in was blocked. Fess asks it each time it looks up the logged-in user and ends the
+         * session when it is {@code true}.
+         *
+         * <p>Not only revocation ends it: when Entra ID demands a fresh sign-in for a policy reason --
+         * {@code invalid_grant} or {@code interaction_required} from Conditional Access or a sign-in
+         * frequency policy -- the session ends too, so that the user signs in again through Entra ID
+         * and the policy is applied there.
+         *
+         * <p>It is also what makes the renewal happen on requests that never reach {@link #refresh()}:
+         * Fess calls that one only for action requests, so a session used through {@code /api/v2}
+         * alone would otherwise never learn of a refusal. Until the token is within
+         * {@link #REFRESH_MARGIN} of expiring this costs a clock read; after that the renewal keeps
+         * the throttle and the single-renewer guard of {@link #refresh()}, so a request that finds
+         * another one renewing does not wait for it. A cache miss or a transient failure does not end
+         * the session. Neither does anything on a node that did not handle the login: a user restored
+         * there holds no access token and its MSAL4J cache none for the account, so it never hears
+         * Entra ID's answer, and this does not attempt the renewal at all.
+         *
+         * <p>Not marked {@code @Override}, like the same method of the SAML and OpenID Connect
+         * plugins: a Fess before 15.10 has no such method to override, and then this is never called.
+         *
+         * @return {@code true} if the login has ended.
+         */
+        public boolean isExpired() {
+            // A user restored from the shared session holds no access token, and this node's
+            // MSAL4J cache holds none for it either, so a renewal here can only miss the cache --
+            // and log a WARN once a minute on every request path -- without ever hearing a refusal.
+            if (!renewalRefused && authResult.accessToken() != null) {
+                // The result of refresh() is not the answer: it is also false for an expired
+                // token whose renewal failed for a reason that says nothing about the account.
+                refresh();
+            }
+            return renewalRefused;
         }
 
         /**

@@ -3296,9 +3296,18 @@ public class EntraIdAuthenticatorTest extends UnitFessTestCase {
      * authority which hosts it trusts.
      */
     private EntraIdAuthenticator authenticatorWithTokenEndpoint(final com.microsoft.aad.msal4j.IHttpClient endpoint) {
-        final ConfidentialClientApplication application;
+        final ConfidentialClientApplication application = clientApplicationWithTokenEndpoint(endpoint);
+        return new EntraIdAuthenticator() {
+            @Override
+            protected ConfidentialClientApplication getClientApplication() {
+                return application;
+            }
+        };
+    }
+
+    private static ConfidentialClientApplication clientApplicationWithTokenEndpoint(final com.microsoft.aad.msal4j.IHttpClient endpoint) {
         try {
-            application = ConfidentialClientApplication
+            return ConfidentialClientApplication
                     .builder("11111111-1111-1111-1111-111111111111",
                             com.microsoft.aad.msal4j.ClientCredentialFactory.createFromSecret("secret-1"))
                     .authority("https://login.microsoftonline.com/contoso.onmicrosoft.com/")
@@ -3308,12 +3317,6 @@ public class EntraIdAuthenticatorTest extends UnitFessTestCase {
         } catch (final Exception e) {
             throw new IllegalStateException(e);
         }
-        return new EntraIdAuthenticator() {
-            @Override
-            protected ConfidentialClientApplication getClientApplication() {
-                return application;
-            }
-        };
     }
 
     private static com.microsoft.aad.msal4j.IHttpClient tokenEndpointAnswering(final int status, final String body) {
@@ -3420,5 +3423,188 @@ public class EntraIdAuthenticatorTest extends UnitFessTestCase {
                     () -> authenticator.getAccessToken(new AuthorizationCode("junk-code"), "http://localhost:8080/sso/"));
             assertFalse(e.toString(), e instanceof SsoStateException);
         }
+    }
+
+    /**
+     * A token endpoint that answers the login's authorization code grant with tokens MSAL4J caches
+     * for a new account, and hands every refresh token grant -- the silent renewal -- to
+     * {@code renewal}. The access token is good for a minute: inside MSAL4J's five-minute expiry
+     * buffer, so the silent acquisition really spends the refresh token (cache refresh reason
+     * EXPIRED, which lets a failure out rather than returning the cached token), and inside
+     * {@code REFRESH_MARGIN}, so {@code EntraIdUser} really attempts it.
+     *
+     * <p>Each call makes a new account, so that no test finds the tokens of another one in a
+     * cache.
+     */
+    private static com.microsoft.aad.msal4j.IHttpClient loginThenRenewal(final AtomicInteger renewals,
+            final com.microsoft.aad.msal4j.IHttpClient renewal) {
+        final String uid = java.util.UUID.randomUUID().toString();
+        final String tid = "22222222-2222-2222-2222-222222222222";
+        final String idToken = new com.nimbusds.jwt.PlainJWT(
+                new com.nimbusds.jwt.JWTClaimsSet.Builder().issuer("https://login.microsoftonline.com/" + tid + "/v2.0")
+                        .audience("11111111-1111-1111-1111-111111111111")
+                        .subject(uid)
+                        .claim("oid", uid)
+                        .claim("tid", tid)
+                        .claim("preferred_username", "taro@contoso.onmicrosoft.com")
+                        .build()).serialize();
+        final String clientInfo = java.util.Base64.getUrlEncoder()
+                .withoutPadding()
+                .encodeToString(("{\"uid\":\"" + uid + "\",\"utid\":\"" + tid + "\"}").getBytes(StandardCharsets.UTF_8));
+        final String tokens = "{\"token_type\":\"Bearer\",\"scope\":\"https://graph.microsoft.com/.default\",\"expires_in\":60,"
+                + "\"ext_expires_in\":60,\"access_token\":\"login-access-token\",\"refresh_token\":\"login-refresh-token\","
+                + "\"id_token\":\"" + idToken + "\",\"client_info\":\"" + clientInfo + "\"}";
+        return request -> {
+            if (request.body() != null && request.body().contains("grant_type=refresh_token")) {
+                renewals.incrementAndGet();
+                return renewal.send(request);
+            }
+            return new com.microsoft.aad.msal4j.HttpResponse().statusCode(200).body(tokens);
+        };
+    }
+
+    /**
+     * An authenticator on the given token endpoint, registered as the component EntraIdUser asks
+     * for, that keeps the users it makes off Microsoft Graph.
+     */
+    private EntraIdAuthenticator registerRenewingAuthenticator(final com.microsoft.aad.msal4j.IHttpClient endpoint) {
+        final ConfidentialClientApplication application = clientApplicationWithTokenEndpoint(endpoint);
+        final EntraIdAuthenticator authenticator = new EntraIdAuthenticator() {
+            @Override
+            protected ConfidentialClientApplication getClientApplication() {
+                return application;
+            }
+
+            @Override
+            public void scheduleUpdateMemberOf(final EntraIdUser user) {
+                // the memberships are not under test
+            }
+        };
+        ComponentUtil.register(authenticator, EntraIdAuthenticator.class.getCanonicalName());
+        ComponentUtil.register(new SystemHelper(), "systemHelper");
+        return authenticator;
+    }
+
+    /** Logs in through the stubbed token endpoint, so MSAL4J's cache holds the account and its refresh token. */
+    private static EntraIdUser logIn(final EntraIdAuthenticator authenticator) {
+        return new EntraIdUser(authenticator.getAccessToken(new AuthorizationCode("login-code"), "http://localhost:8080/sso/"));
+    }
+
+    @Test
+    public void test_refreshTokenSilently_throwsTheRefusalOfEntraId() {
+        // Pins what MSAL4J 1.26 makes of the answers that mean the account has to sign in again:
+        // invalid_grant (a revoked refresh token, a disabled account, a reset password, a blocked
+        // sign-in) becomes MsalInteractionRequiredException, and interaction_required a plain
+        // MsalServiceException carrying that error code.
+        final AtomicInteger renewals = new AtomicInteger();
+        final EntraIdAuthenticator refused = registerRenewingAuthenticator(loginThenRenewal(renewals, tokenEndpointAnswering(400,
+                "{\"error\":\"invalid_grant\",\"error_description\":\"AADSTS50057: The user account is disabled.\",\"error_codes\":[50057]}")));
+        final EntraIdUser user = logIn(refused);
+        final com.microsoft.aad.msal4j.MsalInteractionRequiredException e = org.junit.jupiter.api.Assertions
+                .assertThrows(com.microsoft.aad.msal4j.MsalInteractionRequiredException.class, () -> refused.refreshTokenSilently(user));
+        assertEquals("invalid_grant", e.errorCode());
+        assertEquals(1, renewals.get());
+
+        final EntraIdAuthenticator interaction = registerRenewingAuthenticator(loginThenRenewal(renewals, tokenEndpointAnswering(400,
+                "{\"error\":\"interaction_required\",\"error_description\":\"AADSTS50076: MFA is required.\",\"error_codes\":[50076]}")));
+        final EntraIdUser other = logIn(interaction);
+        final com.microsoft.aad.msal4j.MsalServiceException s = org.junit.jupiter.api.Assertions
+                .assertThrows(com.microsoft.aad.msal4j.MsalServiceException.class, () -> interaction.refreshTokenSilently(other));
+        assertEquals("interaction_required", s.errorCode());
+    }
+
+    @Test
+    public void test_isExpired_endsTheSessionOnceEntraIdRefusesTheRenewal() {
+        final AtomicInteger renewals = new AtomicInteger();
+        final EntraIdAuthenticator authenticator = registerRenewingAuthenticator(loginThenRenewal(renewals, tokenEndpointAnswering(400,
+                "{\"error\":\"invalid_grant\",\"error_description\":\"AADSTS50173: The provided grant has expired due to it being revoked."
+                        + "\\r\\nTrace ID: abc\",\"error_codes\":[50173]}")));
+        final EntraIdUser user = logIn(authenticator);
+
+        assertTrue(user.isExpired());
+        assertEquals(1, renewals.get());
+        // The answer stays: the account has to sign in again, there is nothing left to retry.
+        assertTrue(user.isExpired());
+        assertEquals(1, renewals.get(), "a refused renewal must not be asked again");
+    }
+
+    @Test
+    public void test_isExpired_keepsTheSessionOnACacheMiss() throws Exception {
+        // A session restored on a node that did not handle the login: this node's MSAL4J cache
+        // holds no tokens for the account, so the token endpoint is never asked and Entra ID's
+        // answer never heard. That says nothing about the account, so the session goes on.
+        final AtomicInteger requests = new AtomicInteger();
+        final com.microsoft.aad.msal4j.IHttpClient endpoint = request -> {
+            requests.incrementAndGet();
+            throw new IOException("the token endpoint must not be reached");
+        };
+        final EntraIdAuthenticator authenticator = registerRenewingAuthenticator(endpoint);
+        final long now = ComponentUtil.getSystemHelper().getCurrentTimeAsLong();
+        final EntraIdUser user = new EntraIdCredential(
+                new TestAuthenticationResult(new TestAccount(java.util.UUID.randomUUID().toString()), new Date(now + 30 * 1000L)))
+                        .getUser();
+
+        // What MSAL4J 1.26 throws for it, pinned.
+        final java.util.concurrent.ExecutionException miss = org.junit.jupiter.api.Assertions
+                .assertThrows(java.util.concurrent.ExecutionException.class, () -> authenticator.getClientApplication()
+                        .acquireTokenSilently(com.microsoft.aad.msal4j.SilentParameters
+                                .builder(Collections.singleton("https://graph.microsoft.com/.default"),
+                                        user.getAuthenticationResult().account())
+                                .build())
+                        .get());
+        assertTrue(miss.getCause() instanceof com.microsoft.aad.msal4j.MsalClientException, miss.toString());
+        assertEquals("cache_miss", ((com.microsoft.aad.msal4j.MsalClientException) miss.getCause()).errorCode());
+
+        assertNull(authenticator.refreshTokenSilently(user));
+        assertFalse(user.isExpired());
+        // isExpired() did attempt the renewal: a miss is held off like any other failure.
+        assertTrue(user.renewalThrottledUntil > 0L);
+        assertEquals(0, requests.get());
+    }
+
+    @Test
+    public void test_isExpired_keepsTheSessionOnATransientFailure() {
+        // A token endpoint that fails, is unavailable, cannot be reached or does not answer in time
+        // says nothing about the account.
+        final List<com.microsoft.aad.msal4j.IHttpClient> renewals = List.of(
+                tokenEndpointAnswering(503, "{\"error\":\"temporarily_unavailable\",\"error_description\":\"AADSTS90033: unavailable\"}"),
+                tokenEndpointAnswering(500, ""), tokenEndpointAnswering(200, "<html>"), request -> {
+                    throw new IOException("connection refused");
+                }, request -> {
+                    Thread.sleep(2000L);
+                    throw new IOException("too late");
+                });
+        for (final com.microsoft.aad.msal4j.IHttpClient renewal : renewals) {
+            final AtomicInteger attempts = new AtomicInteger();
+            final EntraIdAuthenticator authenticator = registerRenewingAuthenticator(loginThenRenewal(attempts, renewal));
+            final EntraIdUser user = logIn(authenticator);
+            authenticator.acquisitionTimeout = 500L;
+
+            assertFalse(user.isExpired());
+            assertEquals(1, attempts.get());
+            // ... and the throttle holds the next attempt off, as for any other failure.
+            assertFalse(user.isExpired());
+            assertEquals(1, attempts.get());
+        }
+    }
+
+    @Test
+    public void test_findRefusedRenewal_matchesOnlyAnAnswerThatTheAccountMustSignInAgain() {
+        final com.microsoft.aad.msal4j.MsalServiceException grant = new com.microsoft.aad.msal4j.MsalServiceException("m", "invalid_grant");
+        assertSame(grant, EntraIdAuthenticator.findRefusedRenewal(grant));
+        assertSame(grant, EntraIdAuthenticator.findRefusedRenewal(new java.util.concurrent.ExecutionException(grant)));
+        final com.microsoft.aad.msal4j.MsalServiceException interaction =
+                new com.microsoft.aad.msal4j.MsalServiceException("m", "interaction_required");
+        assertSame(interaction, EntraIdAuthenticator.findRefusedRenewal(new java.util.concurrent.ExecutionException(interaction)));
+
+        assertNull(EntraIdAuthenticator.findRefusedRenewal(new com.microsoft.aad.msal4j.MsalClientException("m", "cache_miss")));
+        assertNull(EntraIdAuthenticator.findRefusedRenewal(new com.microsoft.aad.msal4j.MsalThrottlingException(1000L)));
+        assertNull(EntraIdAuthenticator.findRefusedRenewal(new com.microsoft.aad.msal4j.MsalServiceException("m", "unknown")));
+        assertNull(EntraIdAuthenticator.findRefusedRenewal(new com.microsoft.aad.msal4j.MsalServiceException("m", "invalid_client")));
+        assertNull(EntraIdAuthenticator
+                .findRefusedRenewal(new com.microsoft.aad.msal4j.MsalServiceException("invalid_grant", "server_error")));
+        assertNull(EntraIdAuthenticator.findRefusedRenewal(new java.util.concurrent.TimeoutException()));
+        assertNull(EntraIdAuthenticator.findRefusedRenewal(new RuntimeException("invalid_grant")));
+        assertNull(EntraIdAuthenticator.findRefusedRenewal(null));
     }
 }

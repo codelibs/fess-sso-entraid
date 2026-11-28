@@ -31,6 +31,7 @@ import org.codelibs.fess.helper.ActivityHelper;
 import org.codelibs.fess.helper.SystemHelper;
 import org.codelibs.fess.mylasta.action.FessUserBean;
 import org.codelibs.fess.sso.entraid.EntraIdCredential.EntraIdUser;
+import org.codelibs.fess.unit.LogCapturingAppender;
 import org.codelibs.fess.unit.UnitFessTestCase;
 import org.codelibs.fess.util.ComponentUtil;
 import org.dbflute.optional.OptionalThing;
@@ -39,6 +40,7 @@ import org.junit.jupiter.api.Test;
 import com.microsoft.aad.msal4j.IAccount;
 import com.microsoft.aad.msal4j.IAuthenticationResult;
 import com.microsoft.aad.msal4j.ITenantProfile;
+import com.microsoft.aad.msal4j.MsalServiceException;
 import com.nimbusds.jwt.JWTClaimsSet;
 import com.nimbusds.jwt.PlainJWT;
 
@@ -487,9 +489,9 @@ public class EntraIdUserPermissionTest extends UnitFessTestCase {
 
     @Test
     public void test_refresh_holdsOffAFailingRenewalUntilTheThrottleLapses() {
-        // A revoked refresh token, a disabled account, and an account a logout on another session
-        // evicted from the shared MSAL4J cache all fail for good, and refresh() runs on every
-        // action request. Retrying unconditionally would put back exactly the per-request round
+        // An account a logout on another session evicted from the shared MSAL4J cache, and a
+        // session restored on a node that did not handle the login, fail for good, and refresh()
+        // runs on every action request. Retrying unconditionally would put back exactly the per-request round
         // trip REFRESH_MARGIN was introduced to remove.
         final AtomicLong clock = new AtomicLong(1_700_000_000_000L);
         registerClock(clock);
@@ -586,9 +588,9 @@ public class EntraIdUserPermissionTest extends UnitFessTestCase {
     @Test
     public void test_refresh_holdsOffAfterAnExceptionToo() {
         // The exception path has to back off as well, otherwise the failure it now reports at
-        // WARN -- refreshTokenSilently swallows its own, so in production this is updateMemberOf
-        // or the component lookup throwing -- is written once per request rather than once per
-        // interval, which is exactly the noise the throttle is there to prevent.
+        // WARN -- refreshTokenSilently swallows all but a refusal, so in production this is
+        // updateMemberOf or the component lookup throwing -- is written once per request rather
+        // than once per interval, which is exactly the noise the throttle is there to prevent.
         final AtomicLong clock = new AtomicLong(1_700_000_000_000L);
         registerClock(clock);
         final AtomicInteger acquisitions = new AtomicInteger();
@@ -616,5 +618,119 @@ public class EntraIdUserPermissionTest extends UnitFessTestCase {
         clock.addAndGet(EntraIdUser.RENEWAL_THROTTLE_INTERVAL);
         assertFalse(user.refresh());
         assertEquals(2, acquisitions.get(), "the throttle must lapse rather than give up for good");
+    }
+
+    @Test
+    public void test_isExpired_asksNothingWhileTheTokenIsNotNearExpiry() {
+        // Fess asks this on every request, the searches and /api/v2 included, so until the token
+        // is close to expiring it must not reach MSAL4J at all.
+        final AtomicLong clock = new AtomicLong(1_700_000_000_000L);
+        registerClock(clock);
+        final AtomicInteger acquisitions = new AtomicInteger();
+        ComponentUtil.register(new EntraIdAuthenticator() {
+            @Override
+            public void scheduleUpdateMemberOf(final EntraIdUser user) {
+                // keep the constructor off Microsoft Graph
+            }
+
+            @Override
+            public IAuthenticationResult refreshTokenSilently(final EntraIdUser user) {
+                acquisitions.incrementAndGet();
+                throw new MsalServiceException("AADSTS50057: The user account is disabled.", "invalid_grant");
+            }
+        }, EntraIdAuthenticator.class.getCanonicalName());
+
+        final EntraIdUser user = new EntraIdUser(authResult(new Date(clock.get() + EntraIdUser.REFRESH_MARGIN + 1L), "access-token"));
+
+        assertFalse(user.isExpired());
+        assertEquals(0, acquisitions.get(), "a token that is not near expiry must not be renewed");
+
+        // Once it is, the same call renews it -- for a request that never reaches refresh().
+        clock.addAndGet(1L);
+        assertTrue(user.isExpired());
+        assertEquals(1, acquisitions.get());
+    }
+
+    @Test
+    public void test_isExpired_doesNotWaitForARenewalAlreadyInProgress() throws Exception {
+        // isExpired() runs on every request of the session. A request that finds another one
+        // renewing must neither start a second acquisition nor wait for the first; until the
+        // winner has an answer the session goes on.
+        final AtomicLong clock = new AtomicLong(1_700_000_000_000L);
+        registerClock(clock);
+        final AtomicInteger acquisitions = new AtomicInteger();
+        final CountDownLatch winnerIsAcquiring = new CountDownLatch(1);
+        final CountDownLatch loserIsDone = new CountDownLatch(1);
+        ComponentUtil.register(new EntraIdAuthenticator() {
+            @Override
+            public void scheduleUpdateMemberOf(final EntraIdUser user) {
+                // keep the constructor off Microsoft Graph
+            }
+
+            @Override
+            public IAuthenticationResult refreshTokenSilently(final EntraIdUser user) {
+                acquisitions.incrementAndGet();
+                winnerIsAcquiring.countDown();
+                try {
+                    loserIsDone.await(10L, TimeUnit.SECONDS);
+                } catch (final InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+                throw new MsalServiceException("AADSTS50173: The provided grant has expired due to it being revoked.", "invalid_grant");
+            }
+        }, EntraIdAuthenticator.class.getCanonicalName());
+
+        final EntraIdUser user = new EntraIdUser(authResult(new Date(clock.get() + 30 * 1000L), "access-token"));
+
+        final AtomicBoolean winnerResult = new AtomicBoolean();
+        final Thread winner = new Thread(() -> winnerResult.set(user.isExpired()));
+        winner.start();
+        assertTrue(winnerIsAcquiring.await(10L, TimeUnit.SECONDS));
+
+        assertFalse(user.isExpired());
+        assertEquals(1, acquisitions.get(), "a concurrent request must not start a second silent acquisition");
+        loserIsDone.countDown();
+        winner.join(10000L);
+
+        assertTrue(winnerResult.get());
+        // The refusal the winner heard ends the session for every later request.
+        assertTrue(user.isExpired());
+        assertEquals(1, acquisitions.get());
+    }
+
+    @Test
+    public void test_isExpired_leavesARestoredUserAlone() {
+        // A user restored from the shared session on a node that did not handle the login holds no
+        // access token, and that node's MSAL4J cache none for the account: a renewal there can only
+        // miss the cache, so isExpired() -- asked on every request path -- must not attempt one,
+        // nor log the WARN of the miss on searches and /api/v2.
+        final AtomicLong clock = new AtomicLong(1_700_000_000_000L);
+        registerClock(clock);
+        final AtomicInteger acquisitions = new AtomicInteger();
+        ComponentUtil.register(new EntraIdAuthenticator() {
+            @Override
+            public void scheduleUpdateMemberOf(final EntraIdUser user) {
+                // the restore constructor schedules nothing, but keep Microsoft Graph out regardless
+            }
+
+            @Override
+            public IAuthenticationResult refreshTokenSilently(final EntraIdUser user) {
+                acquisitions.incrementAndGet();
+                return null;
+            }
+        }, EntraIdAuthenticator.class.getCanonicalName());
+
+        final EntraIdUser user = new EntraIdUser(
+                new EntraIdSessionSerializers.RestoredAuthenticationResult(authResult().account(), new Date(clock.get() - 1L)), OBJECT_ID);
+
+        final LogCapturingAppender logs = LogCapturingAppender.attach(EntraIdCredential.class);
+        try {
+            assertFalse(user.isExpired());
+            assertFalse(user.isExpired());
+            assertEquals(0, acquisitions.get(), "a restored user must not be renewed from isExpired()");
+            assertTrue(logs.warnings().isEmpty(), logs.warnings().toString());
+        } finally {
+            logs.detach();
+        }
     }
 }
